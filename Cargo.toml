@@ -1,10 +1,15 @@
 [package]
 name = "sled_to_postgres"
 version = "0.1.0"
-authors = ["Pedro Arruda <pedro.arruda@quero.com>"]
+authors = ["Pedro Arruda <pedrobittencourt3@protonmail.ch>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Replicate your Sled database to Postgres"
+license = "Apache-2.0"
+homepage = "https://github.com/tokahuke/sled_to_postgres"
+repository = "https://github.com/tokahuke/sled_to_postgres"
+keyword = ["postgres", "postgresql", "sled", "replication"]
+readme = "readme.md"
+exclude = ["data"]
 
 [dependencies]
 yaque = "0.3.2"
