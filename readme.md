@@ -75,10 +75,12 @@ Now, after we have configured the replication, let's put it to run. Since `tokio
 
 ```rust
 tokio::spawn(async move {
-    // You may insert stuff prior to starting the replication. This will be
-    // also sent to Postgres.
-    tree.insert(&987i32.to_be_bytes(), &654i32.to_be_bytes()).unwrap();
+    // Do not insert anything before starting the replication. These events will not be logged.
+    // tree.insert(&987i32.to_be_bytes(), &654i32.to_be_bytes()).unwrap();
     
+    // Although the current state of the database *will* be dumped with the 
+    // replication when it starts for the first time.
+
     // Start the replication.
     let (handle, shutdown) = replication.start().await.unwrap();
 
@@ -95,3 +97,7 @@ tokio::spawn(async move {
     handle.await.unwrap();
 });
 ```
+
+## License
+
+This code is licensed under the Apache 2.0 license. See the attached `license` file for further details.
