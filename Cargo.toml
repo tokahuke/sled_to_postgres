@@ -1,0 +1,28 @@
+[package]
+name = "sled_to_postgres"
+version = "0.1.0"
+authors = ["Pedro Arruda <pedro.arruda@quero.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+yaque = "0.3.2"
+sled = "0.32.0-rc1"
+bincode = "1.2.1"
+serde_derive = "1.0.111"
+serde = "1.0.111"
+log = "0.4.8"
+tokio-postgres = "0.5.4"
+futures = "0.3.5"
+native-tls = "0.2.4"
+postgres-native-tls = "0.3.0"
+tokio = { version = "0.2.21", features = [
+    "time", "sync", "rt-threaded", "macros", "blocking"
+] }
+failure = "0.1.8"
+failure_derive = "0.1.8"
+hex = "0.4.2"
+
+[dev-dependencies]
+simple_logger = "1.6.0"
