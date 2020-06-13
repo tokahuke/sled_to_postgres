@@ -1,5 +1,8 @@
 Replicate your Sled database to Postgres.
 
+*WIP: although this is part of a bigger project, it has not yet been used in production.*
+*My use case allows for _some_ small inconsistency. If yours doesn't, _caveat emptor._* 
+
 This is a sample usage example:
 ```rust
 use sled_to_postgres::{Replication, ReplicateTree};
@@ -34,26 +37,29 @@ let setup = Replication::new(
                 y int not null
             );
         ",
-        // This is the command for one insertion. The replication needs to call
-        // this repeatedly for the same data. 
+        // This is the command for one insertion. The replication might need
+        // to call this repeatedly for the same data. 
         insert_statement: "
             insert into a_table values ($1::int, $2::int)
             on conflict (x) do update set x = excluded.x;
         ",
         // This is how you transform a `(key, value)` into the parameters for
         // the above statement.
-        insert_parameters: |key: &[u8], value: &[u8]| vec![
-            Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>,
-            Box::new(decode(&*value)) as Box<dyn ToSql + Send + Sync>
-        ],
+        // ... this is the general and complicated form. You can simplify 
+        // stuff using `params!`.
+        insert_parameters: |key: &[u8], value: &[u8]| {
+            vec![
+                Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>,
+                Box::new(decode(&*value)) as Box<dyn ToSql + Send + Sync>,
+            ]
+        },
         // This is the command for one removal. The replication needs to call
         // this repeatedly for the same data. 
         remove_statement: "delete from a_table where x = $1::int",
         // This is how you transform a `key` into the parameters for the above
         // statement.
-        remove_parameters: |key: &[u8]| vec![
-            Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>
-        ],
+        // ... using `params!` makes it more ergonomic.
+        remove_parameters: |key: &[u8]| params![decode(&*key)],
     });
 
 tokio::spawn(async move {

@@ -377,10 +377,18 @@ impl Shutdown {
     }
 }
 
+#[macro_export]
+macro_rules! params {
+    ($($item:expr),*) => {
+        vec![$(
+            Box::new($item) as Box<dyn tokio_postgres::types::ToSql + Send + Sync>,
+        )*]
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_postgres::types::ToSql;
 
     fn toy_replication(db: sled::Db) -> Replication {
         fn decode(i: &[u8]) -> i32 {
@@ -405,15 +413,8 @@ mod tests {
                 on conflict (x) do update set x = excluded.x;
             ",
             remove_statement: "delete from a_table where x = $1::int",
-            insert_parameters: |key: &[u8], value: &[u8]| {
-                vec![
-                    Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>,
-                    Box::new(decode(&*value)) as Box<dyn ToSql + Send + Sync>,
-                ]
-            },
-            remove_parameters: |key: &[u8]| {
-                vec![Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>]
-            },
+            insert_parameters: |key: &[u8], value: &[u8]| params![decode(&*key), decode(&*value)],
+            remove_parameters: |key: &[u8]| params![decode(&*key)],
         })
     }
 
