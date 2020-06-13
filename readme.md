@@ -1,7 +1,8 @@
 Replicate your Sled database to Postgres.
 
-*WIP: although this is part of a bigger project, it has not yet been used in production.*
-*My use case allows for _some_ small inconsistency. If yours doesn't, _caveat emptor._* 
+**WIP: although this is part of a bigger project, it has not yet been used in production.**
+
+**My use case allows for _some_ small inconsistency. If yours doesn't, _caveat emptor._**
 
 This is a sample usage example:
 ```rust
