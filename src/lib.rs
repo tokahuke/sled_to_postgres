@@ -53,6 +53,9 @@ mod dumper;
 mod pusher;
 mod sender;
 
+/// Reexport of `tokio_postgres::types::ToSql`.
+pub use tokio_postgres::types::ToSql;
+
 use failure_derive::Fail;
 use futures::prelude::*;
 use serde_derive::{Deserialize, Serialize};
@@ -381,7 +384,7 @@ impl Shutdown {
 macro_rules! params {
     ($($item:expr),*) => {
         vec![$(
-            Box::new($item) as Box<dyn tokio_postgres::types::ToSql + Send + Sync>,
+            Box::new($item) as Box<dyn $crate::ToSql + Send + Sync>,
         )*]
     };
 }

@@ -1,13 +1,20 @@
-Replicate your Sled database to Postgres.
+# Replicate your Sled database to Postgres
 
-**WIP: although this is part of a bigger project, it has not yet been used in production.**
+**WIP: although this is part of a bigger project, it has not yet been used in production. My use case allows for _some_ small inconsistency. If yours doesn't, _caveat emptor._**
 
-**My use case allows for _some_ small inconsistency. If yours doesn't, _caveat emptor._**
+## Introduction
 
-This is a sample usage example:
+This crate provides replication from Sled (a Key-Value database) to Postgres (a RDBMS). It uses `tokio_postgres` to connect to Postgres and the `Subscriber` API in Sled to watch for updates. Since Seld is agnostic to the type in the database and Postgres is strongly typed, you must provide the serialization/deserialization functions explicitly whe setting the replication up.
+
+Again, this is still a _work in progress_. Do _not_ use this crate (yet) if you need high reliability. 
+
+## Quickstart 
+
+This is a sample usage example for a single tree. For more trees, just chain more `Replication::push` calls. First of all, let's set up the replication itself:
+
 ```rust
-use sled_to_postgres::{Replication, ReplicateTree};
-use tokio_postgres::types::ToSql;
+// `ToSql` is reexported from `tokio_postgres`.
+use sled_to_postgres::{Replication, ReplicateTree, ToSql};
 
 // Open yout database:
 let db = sled::open("data/db").unwrap();
@@ -62,7 +69,11 @@ let setup = Replication::new(
         // ... using `params!` makes it more ergonomic.
         remove_parameters: |key: &[u8]| params![decode(&*key)],
     });
+```
 
+Now, after we have configured the replication, let's put it to run. Since `tokio_postgres` is based on `tokio`, we will use the `tokio` runtime.
+
+```rust
 tokio::spawn(async move {
     // You may insert stuff prior to starting the replication. This will be
     // also sent to Postgres.
