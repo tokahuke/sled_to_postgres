@@ -99,7 +99,7 @@ tokio::spawn(async move {
     // You need not to await this, but it is recommended.
     handle.await.unwrap();
 });
-```description = "Yaque is yet another disk-backed persistent queue for Rust"
+```
 
 
 ## License
