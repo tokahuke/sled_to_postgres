@@ -223,28 +223,42 @@ impl ReplicationPuller {
             // Yes, temporary (you can optimize this one later):
             let mut update_buffer = Vec::with_capacity(BATCH_SIZE);
 
-            // Receive a batch:
-            while update_buffer.len() < BATCH_SIZE && !is_done {
-                let guard = self.queue_receiver.recv().await.expect("queue error");
-                log::debug!("got event");
-                let deserialized =
-                    bincode::deserialize(&guard).expect("error deserializing update");
+            // Now, control until when you want to receive stuff:
+            let guard = self
+                .queue_receiver
+                .recv_while(|serialized| {
+                    if update_buffer.len() >= BATCH_SIZE || is_done {
+                        return false;
+                    }
 
-                guard.commit();
+                    let deserialized =
+                        bincode::deserialize(&serialized).expect("error deserializing update");
 
-                // Receive until you get a `None`.
-                if let Some(update) = deserialized {
-                    update_buffer.push(update);
-                    log::debug!("pushed event");
-                } else {
-                    is_done = true;
-                    log::debug!("is done");
-                }
-            }
+                    if let Some(update) = deserialized {
+                        update_buffer.push(update);
+                        log::debug!("pushed event");
+                    } else {
+                        is_done = true;
+                    }
+
+                    true
+                })
+                .await
+                .expect("queue error");
 
             log::trace!("got batch");
 
-            // DANGER! This is wrong.
+            // DANGER! TODO This is wrong. You know why!
+            //
+            // This executes queries out of order, so if there if an insertion
+            // and its corresponding deletion happen to be in the same batch,
+            // we could have a race condition in which the line is deleted (a
+            // no-op) before insertion, ending up in a line that should not be
+            // there.
+            //
+            // Alternative is to stop being lazy and to run this code first for
+            // all insertions in the batch and _then_ for all deletions in the
+            // batch.  
             stream::iter(update_buffer.into_iter().zip(systems.iter().cycle()))
                 .for_each_concurrent(None, |(update, system)| async move {
                     'outer: loop {
@@ -264,6 +278,9 @@ impl ReplicationPuller {
                     }
                 })
                 .await;
+
+            log::trace!("committing");
+            guard.commit();
         }
 
         log::info!("finished sending events");
@@ -272,13 +289,19 @@ impl ReplicationPuller {
 
 pub struct ReplicationSender {
     parameters: String,
+    n_connections: usize,
     pullers: Vec<ReplicationPuller>,
 }
 
 impl ReplicationSender {
-    pub fn new(parameters: String, pullers: Vec<ReplicationPuller>) -> ReplicationSender {
+    pub fn new(
+        parameters: String,
+        n_connections: usize,
+        pullers: Vec<ReplicationPuller>,
+    ) -> ReplicationSender {
         ReplicationSender {
             parameters,
+            n_connections,
             pullers,
         }
     }
@@ -306,7 +329,8 @@ impl ReplicationSender {
             .collect::<Vec<_>>();
         let systems = Arc::new(
             future::try_join_all(
-                (0..8usize).map(|_| SqlSystem::init(self.parameters.clone(), all_specs.clone())),
+                (0..self.n_connections)
+                    .map(|_| SqlSystem::init(self.parameters.clone(), all_specs.clone())),
             )
             .await?,
         );

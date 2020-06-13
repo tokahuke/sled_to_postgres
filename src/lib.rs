@@ -2,114 +2,132 @@
 //!
 //! This is a sample usage example:
 //! ```rust
-//! use sled_to_postgres::{Replication, ReplicateTree};
-//! use tokio_postgres::types::ToSql;
+//! // (`ToSql` is reexported from `tokio_postgres`)
+//! use sled_to_postgres::{Replication, ReplicateTree, ToSql};
 //!
+//! // Open yout database:
 //! let db = sled::open("data/db").unwrap();
+//! // Open your tree.
 //! let tree = db.open_tree("a_tree").unwrap();
 //!
+//! /// Makeshift decode.
 //! fn decode(i: &[u8]) -> i32 {
 //!     i32::from_be_bytes([i[0], i[1], i[2], i[3]])
 //! }
 //!
+//! // This is how you set up a replication:
 //! let setup = Replication::new(
+//!         // Put in your credentials.
 //!         "host=localhost dbname=a_db user=someone password=idk",
+//!         // You will need a location in the disk for temporary data.
 //!         "data/replication",
 //!     ).push(ReplicateTree {
+//!         // This is a replication on the tree `a_tree`.
 //!         tree: tree.clone(),
+//!         // You may specify a replication only over a given prefix.
 //!         prefix: vec![],
+//!         // This are the commands for table (and index) creation.
+//!         // This needs to be *idempotent* (create _if not exists_).
 //!         create_commands: "
 //!             create table if not exists a_table (
 //!                 x int primary key,
 //!                 y int not null
 //!             );
 //!         ",
+//!         // This is the command for one insertion. The replication might need
+//!         // to call this repeatedly for the same data.
 //!         insert_statement: "
 //!             insert into a_table values ($1::int, $2::int)
 //!             on conflict (x) do update set x = excluded.x;
 //!         ",
+//!         // This is how you transform a `(key, value)` into the parameters for
+//!         // the above statement.
+//!         // ... this is the general and complicated form. You can simplify
+//!         // stuff using `params!`.
+//!         insert_parameters: |key: &[u8], value: &[u8]| {
+//!             vec![
+//!                 Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>,
+//!                 Box::new(decode(&*value)) as Box<dyn ToSql + Send + Sync>,
+//!             ]
+//!         },
+//!         // This is the command for one removal. The replication needs to call
+//!         // this repeatedly for the same data.
 //!         remove_statement: "delete from a_table where x = $1::int",
-//!         insert_parameters: |key: &[u8], value: &[u8]| vec![
-//!             Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>,
-//!             Box::new(decode(&*value)) as Box<dyn ToSql + Send + Sync>
-//!         ],
-//!         remove_parameters: |key: &[u8]| vec![
-//!             Box::new(decode(&*key)) as Box<dyn ToSql + Send + Sync>
-//!         ],
-//!     }).setup();
-//!
+//!         // This is how you transform a `key` into the parameters for the above
+//!         // statement.
+//!         // ... using `params!` makes it more ergonomic.
+//!         remove_parameters: |key: &[u8]| params![decode(&*key)],
+//!     });
+//!     
 //! tokio::spawn(async move {
-//!     let (replication, shutdown) = setup.await.unwrap();
-//!     let handle = tokio::spawn(replication);
+//!     // Do not insert anything before starting the replication. These events will not be logged.
+//!     // tree.insert(&987i32.to_be_bytes(), &654i32.to_be_bytes()).unwrap();
+//!     
+//!     // Although the current state of the database *will* be dumped with the
+//!     // replication when it starts for the first time.
+//!
+//!     // Start the replication.
+//!     let (handle, shutdown) = replication.start().await.unwrap();
+//!
+//!     // Now, insert something in `a_tree`.
 //!     tree.insert(&123i32.to_be_bytes(), &456i32.to_be_bytes()).unwrap();
 //!     
-//!     // when you are done, trigger shutdown:
+//!     // When you are done, trigger shutdown:
+//!     // It is understood that _there will be no more db operations after this
+//!     // point._
 //!     shutdown.trigger();
+//!
+//!     // Shutdown doesn't happen immediately. It takes at least 500ms.
+//!     // You need not to await this, but it is recommended.
 //!     handle.await.unwrap();
 //! });
 //! ```
 
+#[macro_use]
+mod util;
+
 mod dumper;
+mod error;
 mod pusher;
 mod sender;
 
-/// Reexport of `tokio_postgres::types::ToSql`.
+/// Reexport of `tokio_postgres::types::ToSql`:
 pub use tokio_postgres::types::ToSql;
 
-use failure_derive::Fail;
+pub use crate::error::Error;
+
 use futures::prelude::*;
 use serde_derive::{Deserialize, Serialize};
-use std::fs::File;
-use std::io;
+// use std::fs::File;
+// use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time;
-use tokio_postgres::types::ToSql;
 
-use dumper::Dumper;
-use pusher::ReplicationPusher;
-use sender::{ReplicationPuller, ReplicationSender};
+use crate::dumper::ReplicationDumper;
+use crate::pusher::ReplicationPusher;
+use crate::sender::{ReplicationPuller, ReplicationSender};
 
-const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(500);
+// This is useful for debugging:
+
+#[cfg(debug_assertions)]
 const BATCH_SIZE: usize = 1;
+#[cfg(not(debug_assertions))]
+const BATCH_SIZE: usize = 128;
 
+/// The canonical identification of a prefix within a tree.
+fn file_name_for_tree(tree: &sled::Tree, prefix: &[u8]) -> String {
+    let tree_name = String::from_utf8_lossy(&tree.name()).to_string();
+    format!("{}#{}", tree_name, hex::encode(prefix))
+}
+
+/// An update on the state of the database. This, contrary to `sled::Event`,
+/// serializable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum ReplicationUpdate {
     Insert { key: Vec<u8>, value: Vec<u8> },
     Remove { key: Vec<u8> },
-}
-
-/// Error kind for `sled_to_postgres`.
-#[derive(Debug, Fail)]
-pub enum Error {
-    /// An underlying error from `sled`.
-    #[fail(display = "sled error: {}", _0)]
-    Sled(sled::Error),
-    /// An underlying IO error.
-    #[fail(display = "io error: {}", _0)]
-    Io(io::Error),
-    /// An underlying error from Postgres.
-    #[fail(display = "postgres error: {}", _0)]
-    Postgres(tokio_postgres::Error),
-}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Error {
-        Error::Io(error)
-    }
-}
-
-impl From<sled::Error> for Error {
-    fn from(error: sled::Error) -> Error {
-        Error::Sled(error)
-    }
-}
-
-impl From<tokio_postgres::Error> for Error {
-    fn from(error: tokio_postgres::Error) -> Error {
-        Error::Postgres(error)
-    }
 }
 
 /// Boxed function for transforming from Sled to Postgres for insertion.
@@ -127,7 +145,7 @@ struct ReplicateSpec {
 }
 
 /// Configuration for replication of a single tree.
-pub struct ReplicateTree<'a, I, R> {
+pub struct ReplicateTree<'a, Ins, Rm> {
     /// Tree on which to watch for updates.
     pub tree: sled::Tree,
     /// The prefix on which to watch.
@@ -144,9 +162,9 @@ pub struct ReplicateTree<'a, I, R> {
     pub remove_statement: &'a str,
     /// Conversion from a Sled `(key, value)` pair to Postgres parameters for
     /// inserting.
-    pub insert_parameters: I,
+    pub insert_parameters: Ins,
     /// Conversion from a Sled `key` to Postgres parameters for removal.
-    pub remove_parameters: R,
+    pub remove_parameters: Rm,
 }
 
 /// The type controlling replication configuration.
@@ -155,25 +173,35 @@ pub struct Replication {
     replication_dir: PathBuf,
     trees: Vec<(sled::Tree, Vec<u8>)>,
     replicate_specs: Vec<Arc<ReplicateSpec>>,
+    n_connections: usize,
 }
 
 impl Replication {
     /// Create a new replication with given connection parameters and
     /// replication directory (for the queues).
-    pub fn new<P: AsRef<Path>>(parameters: &str, replication_dir: P) -> Replication {
+    pub fn new<P: AsRef<Path>>(parameters: &str, replication_dir: P) -> Self {
         Replication {
             parameters: parameters.to_owned(),
             replication_dir: replication_dir.as_ref().to_owned(),
             replicate_specs: vec![],
             trees: vec![],
+            n_connections: 8, // default.
         }
     }
 
+    /// Sets the number of connections to be used in the replication. If the
+    /// initial dump phase in place, it will double the total number of
+    /// connections.
+    pub fn n_connections(mut self, n_connections: usize) -> Self {
+        self.n_connections = n_connections;
+        self
+    }
+
     /// Pushes a new replication spec of replication on a tree.
-    pub fn push<'a, I, R>(mut self, replicate_tree: ReplicateTree<'a, I, R>) -> Self
+    pub fn push<'a, Ins, Rm>(mut self, replicate_tree: ReplicateTree<'a, Ins, Rm>) -> Self
     where
-        I: 'static + Send + Sync + Fn(&[u8], &[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
-        R: 'static + Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
+        Ins: 'static + Send + Sync + Fn(&[u8], &[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
+        Rm: 'static + Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
     {
         let spec = ReplicateSpec {
             create_commands: replicate_tree.create_commands.to_owned(),
@@ -190,32 +218,18 @@ impl Replication {
         self
     }
 
-    fn file_name_for_tree(tree: &sled::Tree, prefix: &[u8]) -> String {
-        let tree_name = String::from_utf8_lossy(&tree.name()).to_string();
-        if !prefix.is_empty() {
-            format!("{}#{}", tree_name, hex::encode(prefix),)
-        } else {
-            tree_name
-        }
-    }
-
     /// Directory for queue of a given tree.
     fn dir_for_tree(&self, tree: &sled::Tree, prefix: &[u8]) -> PathBuf {
         self.replication_dir
             .join("updates")
-            .join(&*Replication::file_name_for_tree(tree, prefix))
+            .join(&*file_name_for_tree(tree, prefix))
     }
 
     /// Directory for queue of a given tree for initial dumping.
     fn dir_for_dump(&self, tree: &sled::Tree, prefix: &[u8]) -> PathBuf {
         self.replication_dir
             .join("dumps")
-            .join(&*Replication::file_name_for_tree(tree, prefix))
-    }
-
-    // The name of the file to test if the dump phase is over.
-    fn path_for_is_dumped(&self) -> PathBuf {
-        self.replication_dir.join("is_dumped.flag")
+            .join(&*file_name_for_tree(tree, prefix))
     }
 
     /// Create sender using a given directory name scheme.
@@ -233,15 +247,22 @@ impl Replication {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Create sender:
-        Ok(ReplicationSender::new(self.parameters.clone(), pullers))
+        Ok(ReplicationSender::new(
+            self.parameters.clone(),
+            self.n_connections,
+            pullers,
+        ))
     }
 
-    fn make_dumpers(&self, is_shutdown: Arc<AtomicBool>) -> Result<Vec<Dumper>, crate::Error> {
+    fn make_dumpers(
+        &self,
+        is_shutdown: Arc<AtomicBool>,
+    ) -> Result<Vec<ReplicationDumper>, crate::Error> {
         self.trees
             .iter()
             .cloned()
             .map(|(tree, prefix)| {
-                Dumper::new(
+                ReplicationDumper::new(
                     self.dir_for_dump(&tree, &prefix),
                     tree,
                     prefix,
@@ -255,6 +276,8 @@ impl Replication {
         &self,
         is_shutdown: Arc<AtomicBool>,
     ) -> Result<Vec<ReplicationPusher>, crate::Error> {
+        const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(500);
+
         self.trees
             .iter()
             .map(|(tree, prefix)| {
@@ -269,62 +292,29 @@ impl Replication {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    /// Sets the dump phase of th replication.
+    /// Sets the dump phase of the replication.
     async fn setup_dump(
         &self,
         is_shutdown: Arc<AtomicBool>,
-    ) -> Result<impl Future<Output = bool>, crate::Error> {
+    ) -> Result<impl Future<Output = ()>, crate::Error> {
         // Create dumpers:
         log::debug!("setting up dumpers");
         let dumpers = self.make_dumpers(is_shutdown.clone())?;
 
         // Create sender for dump:
-        log::debug!("setting up senders");
         let send_stuff = self
             .make_sender(|tree, prefix| self.dir_for_dump(tree, prefix))?
             .prepare()
             .await?;
-        log::debug!("done setting up sender");
 
-        // Here it is `join`: wait for everything to end.
         let whole_thing = future::join(
+            send_stuff,
             future::join_all(
                 dumpers
                     .into_iter()
                     .map(|dumper| tokio::task::spawn_blocking(move || dumper.dump())),
             ),
-            Box::pin(send_stuff),
-        )
-        .map(|(was_shutdown, _)| {
-            was_shutdown
-                .into_iter()
-                .any(|flag| flag.expect("task panicked"))
-        });
-
-        Ok(whole_thing)
-    }
-
-    /// Sets the streaming phase of the replication.
-    async fn setup_streaming(
-        &self,
-        is_shutdown: Arc<AtomicBool>,
-    ) -> Result<impl Future<Output = ()>, crate::Error> {
-        // Create pushers:
-        let pushers = self.make_pushers(is_shutdown.clone())?;
-
-        // Create sender:
-        let send_stuff = self
-            .make_sender(|tree, prefix| self.dir_for_tree(tree, prefix))?
-            .prepare()
-            .await?;
-
-        // Here it is `select` because pushers may end and senders will never
-        // end in this case.
-        let whole_thing = future::select(
-            future::join_all(pushers.into_iter().map(|pusher| pusher.push_events())),
-            Box::pin(send_stuff),
-        )
-        .map(|_| ());
+        ).map(|_| ());
 
         Ok(whole_thing)
     }
@@ -336,30 +326,43 @@ impl Replication {
         // Create signaler for shutdown:
         let is_shutdown = Arc::new(AtomicBool::new(false));
 
-        // Set up the conditional dump:
-        let path_for_is_dumped = self.path_for_is_dumped();
-        let maybe_dump = if !path_for_is_dumped.exists() {
-            Some(self.setup_dump(is_shutdown.clone()).await?)
-        } else {
-            None
-        };
-
-        let dumping_part = async move {
-            // Check if you must dump:
-            if let Some(dump) = maybe_dump {
-                // Shutdown if you have to, else cap it off:
-                if dump.await {
-                    // Cap it off:
-                    File::create(path_for_is_dumped).expect("could not create `is_dumped.flag`");
-                }
-            }
-        };
+        // Create pushers:
+        let pushers = self.make_pushers(is_shutdown.clone())?;
+        let push_stuff = future::join_all(pushers.into_iter().map(|pusher| pusher.push_events()));
 
         // Set up the streaming part:
-        let streaming_part = self.setup_streaming(is_shutdown.clone()).await?;
+        let stream_stuff = self
+            .make_sender(|tree, prefix| self.dir_for_tree(tree, prefix))?
+            .prepare()
+            .await?;
 
-        // Assemble the whole thing:
-        let whole_thing = future::join(dumping_part, streaming_part).map(|_| ());
+        // Set up the conditional dump:
+        let maybe_dump = self.setup_dump(is_shutdown.clone()).await?;
+
+        // Create the whole thing!
+        //
+        // BIG NOTE: `select` instead of `join`. Why?
+        //
+        // `push_stuff` will take at least 500ms to stop. It will stop any
+        // sender in the right side and that is ok, since the queues will
+        // rollback. Also, the 500m will give a head-start for the dumpers
+        // (which are _synchronous_) to stop. Now, remember that the dump tasks 
+        // are run as blocking and that the `select` will effectively drop the
+        // handles on their completion. This means that we *have no way* of
+        // waiting on their completion and that we have a possible data race
+        // here!
+        //
+        // On the other side, the dumpers will check the `is_shutdown` often
+        // enough to shutdown in 500ms and so we *hope* (hope!) that this race
+        // condition will be infrequent. Since the consequence of the data race
+        // seems to be basically lost computer power, this looks benign. However,
+        // this hypothesis has not been put to test.
+        // 
+        // Alternatives are making dumps async (difficult, since
+        // `sled::Iter: !Send`) or using `join` and propagating the shutdor using oneshot channels on the end of the dump.wn
+        /// signal into `ReplicationSender`, which is not currently implemented.
+        let whole_thing =
+            future::select(push_stuff, maybe_dump.then(move |_| stream_stuff)).map(|_| ());
 
         Ok((tokio::spawn(whole_thing), Shutdown { is_shutdown }))
     }
@@ -372,21 +375,13 @@ pub struct Shutdown {
 }
 
 impl Shutdown {
-    /// Makes pusher enter "shutdown mode". After this, if any event takes more
-    /// than a predetermined timeout to arrive, it will be dropped and the
-    /// pusher will end. This is the way sled works by now.
+    /// Makes the replication enter "shutdown mode". After this, if any event
+    /// in the pusher side takes more than a predetermined timeout to arrive,
+    /// it will be dropped and the pusher will end. This is the way sled works
+    /// by now.
     pub fn trigger(&self) {
         self.is_shutdown.fetch_or(true, Ordering::Relaxed);
     }
-}
-
-#[macro_export]
-macro_rules! params {
-    ($($item:expr),*) => {
-        vec![$(
-            Box::new($item) as Box<dyn $crate::ToSql + Send + Sync>,
-        )*]
-    };
 }
 
 #[cfg(test)]

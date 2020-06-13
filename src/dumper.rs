@@ -3,32 +3,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::{ReplicationUpdate, BATCH_SIZE};
+use super::{file_name_for_tree, ReplicationUpdate, BATCH_SIZE};
 
-pub struct Dumper {
+pub struct ReplicationDumper {
     queue_sender: yaque::Sender,
     tree: sled::Tree,
     prefix: Vec<u8>,
     is_shutdown: Arc<AtomicBool>,
     key_file: PathBuf,
+    is_dumped_flag: PathBuf,
 }
 
-impl Dumper {
+impl ReplicationDumper {
     pub fn new<P: AsRef<Path>>(
         replication_dir: P,
         tree: sled::Tree,
         prefix: Vec<u8>,
         is_shutdown: Arc<AtomicBool>,
-    ) -> Result<Dumper, crate::Error> {
+    ) -> Result<ReplicationDumper, crate::Error> {
         let queue_sender = yaque::Sender::open(replication_dir.as_ref())?;
         let key_file = replication_dir.as_ref().join("last-key");
+        let is_dumped_flag = replication_dir.as_ref().join("is-dumped.flag");
 
-        Ok(Dumper {
+        Ok(ReplicationDumper {
             queue_sender,
             tree,
             prefix,
             is_shutdown,
             key_file,
+            is_dumped_flag,
         })
     }
 
@@ -42,8 +45,18 @@ impl Dumper {
         fs::write(&self.key_file, &*key).expect("could not save last key")
     }
 
-    /// Does dump, returning where it has ended or not.
-    pub fn dump(mut self) -> bool {
+    /// Does dump, returning where it has ended or not (because of shutdown).
+    pub fn dump(mut self) {
+        // If dumped, do not dump again!
+        if self.is_dumped_flag.exists() {
+            log::info!(
+                "{} already dumped",
+                file_name_for_tree(&self.tree, &self.prefix)
+            );
+            return;
+        }
+
+        // Else, let's dump:
         log::info!("starting to dump events");
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut batch_number: usize = 0;
@@ -105,23 +118,24 @@ impl Dumper {
                 if self.is_shutdown.load(Ordering::Relaxed) {
                     log::info!("dump told to shut down");
                     self.save_last_key(key);
-                    return false;
+
+                    // Returning early prevents dump to be capped off.
+                    return;
                 }
             }
         }
 
         log::debug!("dumper broke off the main loop");
 
-        // Cap it off.
+        // Send the last batch and cap it off.
         batch.push(
             bincode::serialize::<Option<ReplicationUpdate>>(&None).expect("can always serialize"),
         );
-
-        // Send last batch.
         self.queue_sender.send_batch(&batch).expect("queue error");
 
-        log::info!("finished dumping events");
+        // Indicate that dump is over for this dumper:
+        fs::File::create(self.is_dumped_flag).expect("failed to create flag file");
 
-        true
+        log::info!("finished dumping events");
     }
 }

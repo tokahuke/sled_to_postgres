@@ -16,7 +16,7 @@ Again, this is still a _work in progress_. Do _not_ use this crate (yet) if you 
 This is a sample usage example for a single tree. For more trees, just chain more `Replication::push` calls. First of all, let's set up the replication itself:
 
 ```rust
-// `ToSql` is reexported from `tokio_postgres`.
+// (`ToSql` is reexported from `tokio_postgres`)
 use sled_to_postgres::{Replication, ReplicateTree, ToSql};
 
 // Open yout database:
