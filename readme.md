@@ -1,5 +1,8 @@
 # Replicate your Sled database to Postgres
 
+<a href="https://docs.rs/sled_to_postgres"><img src="https://docs.rs/sled_to_postgres/badge.svg"></a>
+<a href="https://crates.io/crates/sled_to_postgres"><img src="https://img.shields.io/crates/v/sled_to_postgres.svg"></a>
+
 **WIP: although this is part of a bigger project, it has not yet been used in production. My use case allows for _some_ small inconsistency. If yours doesn't, _caveat emptor._**
 
 ## Introduction
