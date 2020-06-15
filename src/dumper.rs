@@ -35,6 +35,10 @@ impl ReplicationDumper {
         })
     }
 
+    pub fn was_dumped(&self) -> bool {
+        self.is_dumped_flag.exists()
+    }
+
     fn get_last_key(&self) -> Option<Vec<u8>> {
         fs::read(&self.key_file)
             .map_err(|_| log::info!("could not open last key file"))
@@ -48,7 +52,7 @@ impl ReplicationDumper {
     /// Does dump, returning where it has ended or not (because of shutdown).
     pub fn dump(mut self) {
         // If dumped, do not dump again!
-        if self.is_dumped_flag.exists() {
+        if self.was_dumped() {
             log::info!(
                 "{} already dumped",
                 file_name_for_tree(&self.tree, &self.prefix)

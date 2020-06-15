@@ -198,7 +198,7 @@ impl Replication {
     }
 
     /// Pushes a new replication spec of replication on a tree.
-    pub fn push<'a, Ins, Rm>(mut self, replicate_tree: ReplicateTree<'a, Ins, Rm>) -> Self
+    pub fn push<Ins, Rm>(mut self, replicate_tree: ReplicateTree<'_, Ins, Rm>) -> Self
     where
         Ins: 'static + Send + Sync + Fn(&[u8], &[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
         Rm: 'static + Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
@@ -299,7 +299,8 @@ impl Replication {
     ) -> Result<impl Future<Output = ()>, crate::Error> {
         // Create dumpers:
         log::debug!("setting up dumpers");
-        let dumpers = self.make_dumpers(is_shutdown.clone())?;
+        let dumpers = self
+            .make_dumpers(is_shutdown.clone())?;
 
         // Create sender for dump:
         let send_stuff = self
@@ -314,7 +315,8 @@ impl Replication {
                     .into_iter()
                     .map(|dumper| tokio::task::spawn_blocking(move || dumper.dump())),
             ),
-        ).map(|_| ());
+        )
+        .map(|_| ());
 
         Ok(whole_thing)
     }
@@ -346,7 +348,7 @@ impl Replication {
         // `push_stuff` will take at least 500ms to stop. It will stop any
         // sender in the right side and that is ok, since the queues will
         // rollback. Also, the 500m will give a head-start for the dumpers
-        // (which are _synchronous_) to stop. Now, remember that the dump tasks 
+        // (which are _synchronous_) to stop. Now, remember that the dump tasks
         // are run as blocking and that the `select` will effectively drop the
         // handles on their completion. This means that we *have no way* of
         // waiting on their completion and that we have a possible data race
@@ -357,12 +359,15 @@ impl Replication {
         // condition will be infrequent. Since the consequence of the data race
         // seems to be basically lost computer power, this looks benign. However,
         // this hypothesis has not been put to test.
-        // 
+        //
         // Alternatives are making dumps async (difficult, since
-        // `sled::Iter: !Send`) or using `join` and propagating the shutdor using oneshot channels on the end of the dump.wn
-        /// signal into `ReplicationSender`, which is not currently implemented.
-        let whole_thing =
-            future::select(push_stuff, maybe_dump.then(move |_| stream_stuff)).map(|_| ());
+        // `sled::Iter: !Send`) or using `join` and propagating the shutdown
+        // signal into `ReplicationSender`, which is not currently implemented.
+        let whole_thing = future::select(
+            Box::pin(push_stuff),
+            Box::pin(maybe_dump.then(move |_| stream_stuff)),
+        )
+        .map(|_| ());
 
         Ok((tokio::spawn(whole_thing), Shutdown { is_shutdown }))
     }

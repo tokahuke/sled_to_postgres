@@ -236,12 +236,13 @@ impl ReplicationPuller {
 
                     if let Some(update) = deserialized {
                         update_buffer.push(update);
-                        log::debug!("pushed event");
+                        log::debug!("received event");
+                        true
                     } else {
+                        // Never consume the `None` guard.
                         is_done = true;
+                        false
                     }
-
-                    true
                 })
                 .await
                 .expect("queue error");
@@ -258,7 +259,7 @@ impl ReplicationPuller {
             //
             // Alternative is to stop being lazy and to run this code first for
             // all insertions in the batch and _then_ for all deletions in the
-            // batch.  
+            // batch.
             stream::iter(update_buffer.into_iter().zip(systems.iter().cycle()))
                 .for_each_concurrent(None, |(update, system)| async move {
                     'outer: loop {
