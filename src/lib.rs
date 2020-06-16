@@ -77,7 +77,7 @@
 //!     // point._
 //!     shutdown.trigger();
 //!
-//!     // Shutdown doesn't happen immediately. It takes at least 500ms.
+//!     // ShutdownTrigger doesn't happen immediately. It takes at least 500ms.
 //!     // You need not to await this, but it is recommended.
 //!     handle.await.unwrap();
 //! });
@@ -324,7 +324,7 @@ impl Replication {
     /// Sets the whole system up, returning a future to the completion of the
     /// replication and a channel to _kind of_ trigger the end of the process
     /// of watching for events.
-    pub async fn start(self) -> Result<(tokio::task::JoinHandle<()>, Shutdown), crate::Error> {
+    pub async fn start(self) -> Result<(tokio::task::JoinHandle<()>, ShutdownTrigger), crate::Error> {
         // Create signaler for shutdown:
         let is_shutdown = Arc::new(AtomicBool::new(false));
 
@@ -369,23 +369,60 @@ impl Replication {
         )
         .map(|_| ());
 
-        Ok((tokio::spawn(whole_thing), Shutdown { is_shutdown }))
+        Ok((tokio::spawn(whole_thing), ShutdownTrigger { is_shutdown }))
     }
 }
 
 /// Sends a signal to stop the replication.
 #[derive(Debug)]
-pub struct Shutdown {
+pub struct ShutdownTrigger {
     is_shutdown: Arc<AtomicBool>,
 }
 
-impl Shutdown {
+impl Clone for ShutdownTrigger {
+    fn clone(&self) -> ShutdownTrigger {
+        ShutdownTrigger { is_shutdown: self.is_shutdown.clone() }
+    }
+}
+
+impl ShutdownTrigger {
     /// Makes the replication enter "shutdown mode". After this, if any event
     /// in the pusher side takes more than a predetermined timeout to arrive,
     /// it will be dropped and the pusher will end. This is the way sled works
     /// by now.
     pub fn trigger(&self) {
         self.is_shutdown.fetch_or(true, Ordering::Relaxed);
+    }
+}
+
+/// A structure that can be used to stop a replication and await on its shutdown.
+pub struct ReplicationStopper {
+    shutdown: ShutdownTrigger,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl From<ReplicationStopper> for (ShutdownTrigger, tokio::task::JoinHandle<()>) {
+    fn from(replication_stopper: ReplicationStopper) -> Self {
+        (replication_stopper.shutdown, replication_stopper.handle)
+    }
+}
+
+impl ReplicationStopper {
+    /// Gets a trigger to the replication shutdown. The trigger triggers the
+    /// shutdown, but _does not_ await for the replication to complete.
+    pub fn get_trigger(&self) -> ShutdownTrigger {
+        self.shutdown.clone()   
+    }
+
+    /// Triggers the shutdown of the replication and awaits for its completion.
+    /// 
+    /// # Panics
+    /// 
+    /// This function panics if the task for the replication has panicked.
+    pub async fn stop(self) {
+        // Trigger shutdown:
+        self.shutdown.trigger();
+        self.handle.await.expect("replication panicked")
     }
 }
 
