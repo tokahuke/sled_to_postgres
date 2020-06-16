@@ -67,8 +67,11 @@
 //!     // replication when it starts for the first time.
 //!
 //!     // Start the replication.
-//!     let (handle, shutdown) = replication.start().await.unwrap();
-//!
+//!     let stopper = replication.start().await.unwrap();
+//! 
+//!     // Stopper is a kind of channel:
+//!     let (shutdown, handle) = stopper.into();
+//! 
 //!     // Now, insert something in `a_tree`.
 //!     tree.insert(&123i32.to_be_bytes(), &456i32.to_be_bytes()).unwrap();
 //!     
@@ -80,6 +83,9 @@
 //!     // ShutdownTrigger doesn't happen immediately. It takes at least 500ms.
 //!     // You need not to await this, but it is recommended.
 //!     handle.await.unwrap();
+//! 
+//!     // These two last operations could also be accomplished by calling 
+//!     // `stopper.stop()`. 
 //! });
 //! ```
 
