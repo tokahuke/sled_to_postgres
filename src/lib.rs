@@ -104,8 +104,6 @@ pub use crate::error::Error;
 
 use futures::prelude::*;
 use serde_derive::{Deserialize, Serialize};
-// use std::fs::File;
-// use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -330,7 +328,7 @@ impl Replication {
     /// Sets the whole system up, returning a future to the completion of the
     /// replication and a channel to _kind of_ trigger the end of the process
     /// of watching for events.
-    pub async fn start(self) -> Result<(tokio::task::JoinHandle<()>, ShutdownTrigger), crate::Error> {
+    pub async fn start(self) -> Result<ReplicationStopper, crate::Error> {
         // Create signaler for shutdown:
         let is_shutdown = Arc::new(AtomicBool::new(false));
 
@@ -375,7 +373,10 @@ impl Replication {
         )
         .map(|_| ());
 
-        Ok((tokio::spawn(whole_thing), ShutdownTrigger { is_shutdown }))
+        Ok(ReplicationStopper {
+            handle: tokio::spawn(whole_thing),
+            shutdown: ShutdownTrigger { is_shutdown },
+        })
     }
 }
 
