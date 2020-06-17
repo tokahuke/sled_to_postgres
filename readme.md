@@ -85,7 +85,7 @@ tokio::spawn(async move {
     // replication when it starts for the first time.
 
     // Start the replication.
-    let (handle, shutdown) = replication.start().await.unwrap();
+    let stopper = replication.start().await.unwrap();
 
     // Now, insert something in `a_tree`.
     tree.insert(&123i32.to_be_bytes(), &456i32.to_be_bytes()).unwrap();
@@ -93,14 +93,21 @@ tokio::spawn(async move {
     // When you are done, trigger shutdown:
     // It is understood that _there will be no more db operations after this
     // point._
-    shutdown.trigger();
-
     // Shutdown doesn't happen immediately. It takes at least 500ms.
-    // You need not to await this, but it is recommended.
-    handle.await.unwrap();
+    stopper.stop().await;
 });
 ```
 
+## Limitations and _caveats_
+
+There are some limitations on the current implementation:
+1. Do not use foreign key constraints on the replicated tables. Since Sled
+doesn't have such a concept and updates are inserted in small batches 
+concurrently, the table might not obey this constraint during brief moments.
+2. Be careful to start the replications before any updates are done to the
+database, preferably giving it a head-start of a couple of milliseconds.
+3. Be careful to only trigger the end of the replication when you are
+absolutely sure no more updates are going to be made from that point on.
 
 ## License
 

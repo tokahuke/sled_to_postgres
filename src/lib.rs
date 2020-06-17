@@ -492,7 +492,7 @@ mod tests {
             .unwrap();
 
         log::info!("setting up");
-        let (replication, shutdown) = replication.start().await.unwrap();
+        let stopper = replication.start().await.unwrap();
         log::info!("spawned");
         tree.insert(&123i32.to_be_bytes(), &456i32.to_be_bytes())
             .unwrap();
@@ -502,9 +502,7 @@ mod tests {
         tokio::time::delay_for(tokio::time::Duration::from_millis(1000)).await;
         log::info!("slept. Waking up");
 
-        shutdown.trigger();
-        log::info!("triggered");
-        replication.await.unwrap();
+        stopper.stop().await;
         log::info!("done");
     }
 }
