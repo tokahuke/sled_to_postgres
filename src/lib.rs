@@ -1,6 +1,10 @@
 //! Replicate your Sled database to Postgres.
 //!
-//! This is a sample usage example:
+//! ## Sample usage
+//! 
+//! This is a sample usage example on a db with a single tree. To replicate more
+//! trees, just chain more `Replication::push` calls.
+//! 
 //! ```rust
 //! // (`ToSql` is reexported from `tokio_postgres`)
 //! use sled_to_postgres::{Replication, ReplicateTree, ToSql};
@@ -88,6 +92,17 @@
 //!     // `stopper.stop()`. 
 //! });
 //! ```
+//! 
+//! ## Limitations and _caveats_
+//! 
+//! There are some limitations on the current implementation:
+//! 1. Do not use foreign key constraints on the replicated tables. Since Sled
+//! doesn't have such a concept and updates are inserted in small batches 
+//! concurrently, the table might not obey this constraint during brief moments.
+//! 2. Be careful to start the replications before any updates are done to the
+//! database, preferably giving it a head-start of a couple of milliseconds.
+//! 3. Be careful to only trigger the end of the replication when you are
+//! absolutely sure no more updates are going to be made from that point on.
 
 #[macro_use]
 mod util;
