@@ -1,15 +1,15 @@
 //! Replicate your Sled database to Postgres.
 //!
 //! ## Sample usage
-//! 
+//!
 //! This is a sample usage example on a db with a single tree. To replicate more
 //! trees, just chain more `Replication::push` calls.
-//! 
+//!
 //! ```rust
 //! // (`ToSql` is reexported from `tokio_postgres`)
 //! use sled_to_postgres::{Replication, ReplicateTree, ToSql};
 //!
-//! // Open yout database:
+//! // Open your database:
 //! let db = sled::open("data/db").unwrap();
 //! // Open your tree.
 //! let tree = db.open_tree("a_tree").unwrap();
@@ -72,10 +72,10 @@
 //!
 //!     // Start the replication.
 //!     let stopper = replication.start().await.unwrap();
-//! 
+//!
 //!     // Stopper is a kind of channel:
 //!     let (shutdown, handle) = stopper.into();
-//! 
+//!
 //!     // Now, insert something in `a_tree`.
 //!     tree.insert(&123i32.to_be_bytes(), &456i32.to_be_bytes()).unwrap();
 //!     
@@ -87,17 +87,17 @@
 //!     // ShutdownTrigger doesn't happen immediately. It takes at least 500ms.
 //!     // You need not to await this, but it is recommended.
 //!     handle.await.unwrap();
-//! 
-//!     // These two last operations could also be accomplished by calling 
-//!     // `stopper.stop()`. 
+//!
+//!     // These two last operations could also be accomplished by calling
+//!     // `stopper.stop()`.
 //! });
 //! ```
-//! 
+//!
 //! ## Limitations and _caveats_
-//! 
+//!
 //! There are some limitations on the current implementation:
 //! 1. Do not use foreign key constraints on the replicated tables. Since Sled
-//! doesn't have such a concept and updates are inserted in small batches 
+//! doesn't have such a concept and updates are inserted in small batches
 //! concurrently, the table might not obey this constraint during brief moments.
 //! 2. Be careful to start the replications before any updates are done to the
 //! database, preferably giving it a head-start of a couple of milliseconds.
@@ -256,12 +256,17 @@ impl Replication {
     where
         F: Fn(&sled::Tree, &[u8]) -> PathBuf,
     {
+        const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(200);
         let pullers = self
             .replicate_specs
             .iter()
             .zip(&self.trees)
             .map(|(spec, (tree, prefix))| {
-                ReplicationPuller::new(dir_name(tree, prefix), spec.clone())
+                ReplicationPuller::new(
+                    dir_name(tree, prefix),
+                    spec.clone(),
+                    DEFAULT_INACTIVE_PERIOD,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -311,6 +316,19 @@ impl Replication {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    /// Tries to recover the underlying queues.
+    pub fn recover(&self) -> std::io::Result<()> {
+        self.trees.iter().map(|(tree, prefix)| {
+            let dump = self.dir_for_dump(tree, prefix);
+            let updates = self.dir_for_tree(tree, prefix);
+            yaque::recovery::unlock_queue(&dump)?;
+            yaque::recovery::guess_send_metadata(&dump)?;
+            yaque::recovery::unlock_queue(&updates)?;
+            yaque::recovery::guess_send_metadata(&updates)?;
+            Ok(())
+        }).collect::<Result<Vec<_>, _>>().map(|_| ())
+    }
+
     /// Sets the dump phase of the replication.
     async fn setup_dump(
         &self,
@@ -318,8 +336,7 @@ impl Replication {
     ) -> Result<impl Future<Output = ()>, crate::Error> {
         // Create dumpers:
         log::debug!("setting up dumpers");
-        let dumpers = self
-            .make_dumpers(is_shutdown.clone())?;
+        let dumpers = self.make_dumpers(is_shutdown.clone())?;
 
         // Create sender for dump:
         let send_stuff = self
@@ -403,7 +420,9 @@ pub struct ShutdownTrigger {
 
 impl Clone for ShutdownTrigger {
     fn clone(&self) -> ShutdownTrigger {
-        ShutdownTrigger { is_shutdown: self.is_shutdown.clone() }
+        ShutdownTrigger {
+            is_shutdown: self.is_shutdown.clone(),
+        }
     }
 }
 
@@ -433,13 +452,13 @@ impl ReplicationStopper {
     /// Gets a trigger to the replication shutdown. The trigger triggers the
     /// shutdown, but _does not_ await for the replication to complete.
     pub fn get_trigger(&self) -> ShutdownTrigger {
-        self.shutdown.clone()   
+        self.shutdown.clone()
     }
 
     /// Triggers the shutdown of the replication and awaits for its completion.
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// This function panics if the task for the replication has panicked.
     pub async fn stop(self) {
         // Trigger shutdown:

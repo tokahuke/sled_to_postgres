@@ -36,6 +36,24 @@ impl ReplicationPusher {
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut batch_number: usize = 0;
 
+        // Create batch saver thingy:
+        let queue_sender = &mut self.queue_sender;
+        let mut save = move |batch: &mut Vec<_>| {
+            queue_sender.send_batch(&*batch).expect("queue error");
+            batch.clear();
+            log::trace!("sent");
+
+            batch_number += 1;
+
+            // Save every now and then...
+            if batch_number % 3 == 0 {
+                log::trace!("saving queue state");
+                queue_sender.save().expect("queue error");
+                log::trace!("queue state saved");
+            }
+        };
+
+        // Now, to the main course:
         loop {
             let timeout = time::delay_for(self.inactive_period);
             match future::select(&mut self.subscriber, timeout).await {
@@ -45,7 +63,9 @@ impl ReplicationPusher {
                         log::debug!("is shutdown and has timed out");
                         break;
                     } else {
+                        // Let's take the opportunity to sate stuff:
                         log::trace!("has timed out but is not shutdown");
+                        save(&mut batch);
                     }
                 }
                 // Subscriber ended:
@@ -73,18 +93,7 @@ impl ReplicationPusher {
 
                     if batch.len() >= BATCH_SIZE {
                         log::trace!("batch full. Sending to queue");
-                        self.queue_sender.send_batch(&batch).expect("queue error");
-                        batch.clear();
-                        log::trace!("sent");
-
-                        batch_number += 1;
-
-                        // Save every now and then...
-                        if batch_number % 3 == 0 {
-                            log::trace!("saving queue state");
-                            self.queue_sender.save().expect("queue error");
-                            log::trace!("queue state saved");
-                        }
+                        save(&mut batch);
                     }
                 }
             }
@@ -94,8 +103,8 @@ impl ReplicationPusher {
 
         if !batch.is_empty() {
             log::trace!("batch was not empty. Will send remaining");
-            self.queue_sender.send_batch(&batch).expect("queue error");
-            log::debug!("sent");
+            self.queue_sender.send_batch(&*batch).expect("queue error");
+            self.queue_sender.save().expect("queue error");
         }
 
         log::info!("finished pushing events");

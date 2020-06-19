@@ -7,7 +7,7 @@
 
 ## Introduction
 
-This crate provides replication from Sled (a Key-Value database) to Postgres (a RDBMS). It uses `tokio_postgres` to connect to Postgres and the `Subscriber` API in Sled to watch for updates. Since Seld is agnostic to the type in the database and Postgres is strongly typed, you must provide the serialization/deserialization functions explicitly whe setting the replication up.
+This crate provides replication from Sled (a Key-Value database) to Postgres (a RDBMS). It uses `tokio_postgres` to connect to Postgres and the `Subscriber` API in Sled to watch for updates. Since Sled is agnostic to the type in the database and Postgres is strongly typed, you must provide the serialization/deserialization functions explicitly whe setting the replication up.
 
 Again, this is still a _work in progress_. Do _not_ use this crate (yet) if you need high reliability. 
 
@@ -19,7 +19,7 @@ This is a sample usage example for a single tree. For more trees, just chain mor
 // (`ToSql` is reexported from `tokio_postgres`)
 use sled_to_postgres::{Replication, ReplicateTree, ToSql};
 
-// Open yout database:
+// Open your database:
 let db = sled::open("data/db").unwrap();
 // Open your tree.
 let tree = db.open_tree("a_tree").unwrap();

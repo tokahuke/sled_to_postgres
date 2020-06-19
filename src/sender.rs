@@ -9,7 +9,7 @@ use tokio::time::{delay_for, Duration};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Statement};
 
-use super::{ReplicateSpec, ReplicationUpdate, BATCH_SIZE};
+use super::{ReplicateSpec, ReplicationUpdate};
 
 const UPDATE_EXPONENTIAL_BACKOFF: ExponentialBackoff = ExponentialBackoff {
     millis: 10.0,
@@ -99,17 +99,15 @@ impl SqlSystemInner {
     ) -> Result<SqlSystemInner, crate::Error> {
         // Create prepared statements which we will use to upload stuff.
         let client = connect(&parameters).await;
-        let insert_statements = future::try_join_all(
-            replicate_specs
-                .iter()
-                .map(|spec| client.prepare(&spec.insert_statement)),
-        )
+        let insert_statements = future::try_join_all(replicate_specs.iter().map(|spec| {
+            // log::info!("{}", spec.insert_statement);
+            client.prepare(&spec.insert_statement)
+        }))
         .await?;
-        let remove_statements = future::try_join_all(
-            replicate_specs
-                .iter()
-                .map(|spec| client.prepare(&spec.remove_statement)),
-        )
+        let remove_statements = future::try_join_all(replicate_specs.iter().map(|spec| {
+            // log::info!("{}", spec.remove_statement);
+            client.prepare(&spec.remove_statement)
+        }))
         .await?;
 
         Ok(SqlSystemInner {
@@ -199,18 +197,21 @@ impl SqlSystem {
 pub struct ReplicationPuller {
     queue_receiver: yaque::Receiver,
     replicate_spec: Arc<ReplicateSpec>,
+    inactive_period: Duration,
 }
 
 impl ReplicationPuller {
     pub(crate) fn new<P: AsRef<Path>>(
         replication_dir: P,
         replicate_spec: Arc<ReplicateSpec>,
+        inactive_period: Duration,
     ) -> Result<ReplicationPuller, crate::Error> {
         let queue_receiver = yaque::Receiver::open(replication_dir)?;
 
         Ok(ReplicationPuller {
             queue_receiver,
             replicate_spec,
+            inactive_period,
         })
     }
 
@@ -221,31 +222,42 @@ impl ReplicationPuller {
         // Now, upload stuff while they come in...
         while !is_done {
             // Yes, temporary (you can optimize this one later):
-            let mut update_buffer = Vec::with_capacity(BATCH_SIZE);
+            let mut update_buffer = Vec::with_capacity(128);
 
-            // Now, control until when you want to receive stuff:
-            let guard = self
-                .queue_receiver
-                .recv_while(|serialized| {
-                    if update_buffer.len() >= BATCH_SIZE || is_done {
-                        return false;
-                    }
-
-                    let deserialized =
-                        bincode::deserialize(&serialized).expect("error deserializing update");
-
-                    if let Some(update) = deserialized {
-                        update_buffer.push(update);
-                        log::debug!("received event");
-                        true
-                    } else {
-                        // Never consume the `None` guard.
-                        is_done = true;
-                        false
-                    }
-                })
+            loop {
+                // Yes, now that receiving is atomic, I can do this.
+                match future::select(
+                    Box::pin(self.queue_receiver.recv()),
+                    delay_for(self.inactive_period),
+                )
                 .await
-                .expect("queue error");
+                {
+                    // Timed out! Let's send what we have got.
+                    future::Either::Right((_, _)) => {
+                        break;
+                    }
+                    // Received something:
+                    future::Either::Left((maybe_guard, _)) => {
+                        let guard = maybe_guard.expect("queue error");
+                        let deserialized =
+                            bincode::deserialize(&guard).expect("error deserializing update");
+
+                        if let Some(update) = deserialized {
+                            update_buffer.push(update);
+                            guard.commit();
+                            log::debug!("received event");
+                        } else {
+                            // Never consume the `None` guard.
+                            guard.rollback().expect("queue error");
+                            is_done = true;
+                        }
+
+                        if is_done || update_buffer.len() >= 128 {
+                            break;
+                        }
+                    }
+                }
+            }
 
             log::trace!("got batch");
 
@@ -281,7 +293,6 @@ impl ReplicationPuller {
                 .await;
 
             log::trace!("committing");
-            guard.commit();
         }
 
         log::info!("finished sending events");
@@ -313,11 +324,10 @@ impl ReplicationSender {
         // Ensuring schema:
         log::info!("ensuring schema is initiated");
         let client = connect(&self.parameters).await;
-        future::try_join_all(
-            self.pullers
-                .iter()
-                .map(|puller| client.batch_execute(&puller.replicate_spec.create_commands)),
-        )
+        future::try_join_all(self.pullers.iter().map(|puller| {
+            // log::info!("{}", puller.replicate_spec.create_commands);
+            client.batch_execute(&puller.replicate_spec.create_commands)
+        }))
         .await?;
 
         log::info!("preparing statements");
