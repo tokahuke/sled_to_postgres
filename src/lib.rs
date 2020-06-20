@@ -156,6 +156,7 @@ type InsertParameters =
 type RemoveParameters = Box<dyn Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
 
 struct ReplicateSpec {
+    tree_name: String,
     create_commands: String,
     insert_statement: String,
     remove_statement: String,
@@ -223,6 +224,7 @@ impl Replication {
         Rm: 'static + Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
     {
         let spec = ReplicateSpec {
+            tree_name: file_name_for_tree(&replicate_tree.tree, &replicate_tree.prefix),
             create_commands: replicate_tree.create_commands.to_owned(),
             insert_statement: replicate_tree.insert_statement.to_owned(),
             remove_statement: replicate_tree.remove_statement.to_owned(),
@@ -318,15 +320,19 @@ impl Replication {
 
     /// Tries to recover the underlying queues.
     pub fn recover(&self) -> std::io::Result<()> {
-        self.trees.iter().map(|(tree, prefix)| {
-            let dump = self.dir_for_dump(tree, prefix);
-            let updates = self.dir_for_tree(tree, prefix);
-            yaque::recovery::unlock_queue(&dump)?;
-            yaque::recovery::guess_send_metadata(&dump)?;
-            yaque::recovery::unlock_queue(&updates)?;
-            yaque::recovery::guess_send_metadata(&updates)?;
-            Ok(())
-        }).collect::<Result<Vec<_>, _>>().map(|_| ())
+        self.trees
+            .iter()
+            .map(|(tree, prefix)| {
+                let dump = self.dir_for_dump(tree, prefix);
+                let updates = self.dir_for_tree(tree, prefix);
+                yaque::recovery::unlock_queue(&dump)?;
+                yaque::recovery::guess_send_metadata(&dump)?;
+                yaque::recovery::unlock_queue(&updates)?;
+                yaque::recovery::guess_send_metadata(&updates)?;
+                Ok(())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|_| ())
     }
 
     /// Sets the dump phase of the replication.

@@ -273,21 +273,29 @@ impl ReplicationPuller {
             // all insertions in the batch and _then_ for all deletions in the
             // batch.
             stream::iter(update_buffer.into_iter().zip(systems.iter().cycle()))
-                .for_each_concurrent(None, |(update, system)| async move {
-                    'outer: loop {
-                        let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
+                .for_each_concurrent(None, |(update, system)| {
+                    let spec = self.replicate_spec.clone();
 
-                        while backoff.tick().await {
-                            if let Err(err) = system.send(spec_number, &update).await {
-                                log::warn!("could not update (retrying): {}", err);
-                            } else {
-                                log::trace!("sent event");
-                                break 'outer;
-                            };
+                    async move {
+                        'outer: loop {
+                            let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
+
+                            while backoff.tick().await {
+                                if let Err(err) = system.send(spec_number, &update).await {
+                                    log::warn!(
+                                        "could not update `{}` (retrying): {}",
+                                        &spec.tree_name,
+                                        err
+                                    );
+                                } else {
+                                    log::trace!("sent event");
+                                    break 'outer;
+                                };
+                            }
+
+                            log::warn!("too many retries to send update. Will trigger reconnect.");
+                            system.trigger_refresh().await;
                         }
-
-                        log::warn!("too many retries to send update. Will trigger reconnect.");
-                        system.trigger_refresh().await;
                     }
                 })
                 .await;
