@@ -13,7 +13,7 @@ exclude = ["data"]
 
 [dependencies]
 yaque = "0.4.1"
-sled = "0.32.0-rc1"
+sled = "0.32.0"
 bincode = "1.2.1"
 serde_derive = "1.0.111"
 serde = "1.0.111"

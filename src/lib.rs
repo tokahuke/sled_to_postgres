@@ -126,17 +126,14 @@ use tokio::time;
 
 use crate::dumper::ReplicationDumper;
 use crate::pusher::ReplicationPusher;
-use crate::sender::{ReplicationPuller, ReplicationSender};
+use crate::sender::{ReplicationSender, ReplicationSenderPool};
 
 // This is useful for debugging:
 
-#[cfg(debug_assertions)]
-const BATCH_SIZE: usize = 1;
-#[cfg(not(debug_assertions))]
 const BATCH_SIZE: usize = 128;
 
 /// The canonical identification of a prefix within a tree.
-fn file_name_for_tree(tree: &sled::Tree, prefix: &[u8]) -> String {
+fn name_for_tree(tree: &sled::Tree, prefix: &[u8]) -> String {
     let tree_name = String::from_utf8_lossy(&tree.name()).to_string();
     format!("{}#{}", tree_name, hex::encode(prefix))
 }
@@ -156,7 +153,6 @@ type InsertParameters =
 type RemoveParameters = Box<dyn Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
 
 struct ReplicateSpec {
-    tree_name: String,
     create_commands: String,
     insert_statement: String,
     remove_statement: String,
@@ -224,7 +220,6 @@ impl Replication {
         Rm: 'static + Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
     {
         let spec = ReplicateSpec {
-            tree_name: file_name_for_tree(&replicate_tree.tree, &replicate_tree.prefix),
             create_commands: replicate_tree.create_commands.to_owned(),
             insert_statement: replicate_tree.insert_statement.to_owned(),
             remove_statement: replicate_tree.remove_statement.to_owned(),
@@ -240,32 +235,27 @@ impl Replication {
     }
 
     /// Directory for queue of a given tree.
-    fn dir_for_tree(&self, tree: &sled::Tree, prefix: &[u8]) -> PathBuf {
-        self.replication_dir
-            .join("updates")
-            .join(&*file_name_for_tree(tree, prefix))
+    fn dir_for_stream(&self) -> PathBuf {
+        self.replication_dir.join("updates")
     }
 
     /// Directory for queue of a given tree for initial dumping.
-    fn dir_for_dump(&self, tree: &sled::Tree, prefix: &[u8]) -> PathBuf {
-        self.replication_dir
-            .join("dumps")
-            .join(&*file_name_for_tree(tree, prefix))
+    fn dir_for_dump(&self) -> PathBuf {
+        self.replication_dir.join("dumps")
     }
 
     /// Create sender using a given directory name scheme.
-    fn make_sender<F>(&self, dir_name: F) -> Result<ReplicationSender, crate::Error>
-    where
-        F: Fn(&sled::Tree, &[u8]) -> PathBuf,
-    {
+    fn make_senders<P: AsRef<Path>>(&self, base: P) -> Result<ReplicationSenderPool, crate::Error> {
         const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(200);
         let pullers = self
             .replicate_specs
             .iter()
             .zip(&self.trees)
             .map(|(spec, (tree, prefix))| {
-                ReplicationPuller::new(
-                    dir_name(tree, prefix),
+                ReplicationSender::new(
+                    base.as_ref(),
+                    tree,
+                    prefix,
                     spec.clone(),
                     DEFAULT_INACTIVE_PERIOD,
                 )
@@ -273,7 +263,7 @@ impl Replication {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Create sender:
-        Ok(ReplicationSender::new(
+        Ok(ReplicationSenderPool::new(
             self.parameters.clone(),
             self.n_connections,
             pullers,
@@ -288,12 +278,7 @@ impl Replication {
             .iter()
             .cloned()
             .map(|(tree, prefix)| {
-                ReplicationDumper::new(
-                    self.dir_for_dump(&tree, &prefix),
-                    tree,
-                    prefix,
-                    is_shutdown.clone(),
-                )
+                ReplicationDumper::new(self.dir_for_dump(), tree, prefix, is_shutdown.clone())
             })
             .collect::<Result<Vec<_>, _>>()
     }
@@ -308,7 +293,7 @@ impl Replication {
             .iter()
             .map(|(tree, prefix)| {
                 ReplicationPusher::new(
-                    &self.dir_for_tree(&tree, prefix),
+                    &self.dir_for_stream(),
                     &tree,
                     &prefix,
                     is_shutdown.clone(),
@@ -320,15 +305,19 @@ impl Replication {
 
     /// Tries to recover the underlying queues.
     pub fn recover(&self) -> std::io::Result<()> {
+        let dump = self.dir_for_dump();
+        let stream = self.dir_for_stream();
+
         self.trees
             .iter()
             .map(|(tree, prefix)| {
-                let dump = self.dir_for_dump(tree, prefix);
-                let updates = self.dir_for_tree(tree, prefix);
+                let tree_name = name_for_tree(tree, prefix);
+                let dump = dump.join(&tree_name);
+                let stream = stream.join(&tree_name);
                 yaque::recovery::unlock_queue(&dump)?;
                 yaque::recovery::guess_send_metadata(&dump)?;
-                yaque::recovery::unlock_queue(&updates)?;
-                yaque::recovery::guess_send_metadata(&updates)?;
+                yaque::recovery::unlock_queue(&stream)?;
+                yaque::recovery::guess_send_metadata(&stream)?;
                 Ok(())
             })
             .collect::<Result<Vec<_>, _>>()
@@ -345,10 +334,7 @@ impl Replication {
         let dumpers = self.make_dumpers(is_shutdown.clone())?;
 
         // Create sender for dump:
-        let send_stuff = self
-            .make_sender(|tree, prefix| self.dir_for_dump(tree, prefix))?
-            .prepare()
-            .await?;
+        let send_stuff = self.make_senders(&self.dir_for_dump())?.prepare().await?;
 
         let whole_thing = future::join(
             send_stuff,
@@ -375,10 +361,7 @@ impl Replication {
         let push_stuff = future::join_all(pushers.into_iter().map(|pusher| pusher.push_events()));
 
         // Set up the streaming part:
-        let stream_stuff = self
-            .make_sender(|tree, prefix| self.dir_for_tree(tree, prefix))?
-            .prepare()
-            .await?;
+        let stream_stuff = self.make_senders(&self.dir_for_stream())?.prepare().await?;
 
         // Set up the conditional dump:
         let maybe_dump = self.setup_dump(is_shutdown.clone()).await?;

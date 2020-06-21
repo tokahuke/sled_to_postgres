@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time;
 
-use super::{ReplicationUpdate, BATCH_SIZE};
+use super::{name_for_tree, ReplicationUpdate, BATCH_SIZE};
 
 pub struct ReplicationPusher {
+    tree_name: String,
     queue_sender: yaque::Sender,
     subscriber: sled::Subscriber,
     is_shutdown: Arc<AtomicBool>,
@@ -24,6 +25,7 @@ impl ReplicationPusher {
         let queue_sender = yaque::Sender::open(replication_dir)?;
 
         Ok(ReplicationPusher {
+            tree_name: name_for_tree(tree, prefix),
             queue_sender,
             subscriber: tree.watch_prefix(prefix),
             is_shutdown,
@@ -32,12 +34,13 @@ impl ReplicationPusher {
     }
 
     pub async fn push_events(mut self) {
-        log::info!("starting to push events");
+        log::info!("starting to push events for {}", self.tree_name);
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut batch_number: usize = 0;
 
         // Create batch saver thingy:
         let queue_sender = &mut self.queue_sender;
+        let tree_name = &self.tree_name;
         let mut save = move |batch: &mut Vec<_>| {
             queue_sender.send_batch(&*batch).expect("queue error");
             batch.clear();
@@ -47,9 +50,9 @@ impl ReplicationPusher {
 
             // Save every now and then...
             if batch_number % 3 == 0 {
-                log::trace!("saving queue state");
+                log::trace!("saving queue state for {}", tree_name);
                 queue_sender.save().expect("queue error");
-                log::trace!("queue state saved");
+                log::trace!("queue state saved for {}", tree_name);
             }
         };
 
@@ -70,12 +73,12 @@ impl ReplicationPusher {
                 }
                 // Subscriber ended:
                 future::Either::Left((None, _)) => {
-                    log::info!("subscriber finished");
+                    log::info!("subscriber to {} finished", self.tree_name);
                     break;
                 }
                 // Got event:
                 future::Either::Left((Some(event), _)) => {
-                    log::trace!("got event");
+                    log::trace!("got event for {}", self.tree_name);
 
                     let update = match event {
                         sled::Event::Insert { key, value } => ReplicationUpdate::Insert {
@@ -92,14 +95,14 @@ impl ReplicationPusher {
                     batch.push(bincode::serialize(&Some(update)).expect("can always serialize"));
 
                     if batch.len() >= BATCH_SIZE {
-                        log::trace!("batch full. Sending to queue");
+                        log::trace!("batch full. Sending to queue for {}", self.tree_name);
                         save(&mut batch);
                     }
                 }
             }
         }
 
-        log::debug!("pusher broke out from main loop");
+        log::debug!("pusher broke out from main loop for {}", self.tree_name);
 
         if !batch.is_empty() {
             log::trace!("batch was not empty. Will send remaining");
@@ -107,6 +110,6 @@ impl ReplicationPusher {
             self.queue_sender.save().expect("queue error");
         }
 
-        log::info!("finished pushing events");
+        log::info!("finished pushing events for {}", self.tree_name);
     }
 }

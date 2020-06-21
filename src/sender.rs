@@ -9,7 +9,7 @@ use tokio::time::{delay_for, Duration};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Statement};
 
-use super::{ReplicateSpec, ReplicationUpdate};
+use super::{name_for_tree, ReplicateSpec, ReplicationUpdate};
 
 const UPDATE_EXPONENTIAL_BACKOFF: ExponentialBackoff = ExponentialBackoff {
     millis: 10.0,
@@ -194,21 +194,26 @@ impl SqlSystem {
     }
 }
 
-pub struct ReplicationPuller {
+pub struct ReplicationSender {
+    tree_name: String,
     queue_receiver: yaque::Receiver,
     replicate_spec: Arc<ReplicateSpec>,
     inactive_period: Duration,
 }
 
-impl ReplicationPuller {
+impl ReplicationSender {
     pub(crate) fn new<P: AsRef<Path>>(
-        replication_dir: P,
+        base: P,
+        tree: &sled::Tree,
+        prefix: &[u8],
         replicate_spec: Arc<ReplicateSpec>,
         inactive_period: Duration,
-    ) -> Result<ReplicationPuller, crate::Error> {
-        let queue_receiver = yaque::Receiver::open(replication_dir)?;
+    ) -> Result<ReplicationSender, crate::Error> {
+        let tree_name = name_for_tree(tree, prefix);
+        let queue_receiver = yaque::Receiver::open(base.as_ref().join(&tree_name))?;
 
-        Ok(ReplicationPuller {
+        Ok(ReplicationSender {
+            tree_name,
             queue_receiver,
             replicate_spec,
             inactive_period,
@@ -216,8 +221,9 @@ impl ReplicationPuller {
     }
 
     async fn send_events(mut self, spec_number: usize, systems: Arc<Vec<SqlSystem>>) {
-        log::info!("puller started to send events");
+        log::info!("puller started to send events for {}", self.tree_name);
         let mut is_done = false;
+        let tree_name = Arc::new(self.tree_name.clone());
 
         // Now, upload stuff while they come in...
         while !is_done {
@@ -245,7 +251,7 @@ impl ReplicationPuller {
                         if let Some(update) = deserialized {
                             update_buffer.push(update);
                             guard.commit();
-                            log::debug!("received event");
+                            log::debug!("received event for {}", tree_name);
                         } else {
                             // Never consume the `None` guard.
                             guard.rollback().expect("queue error");
@@ -259,7 +265,7 @@ impl ReplicationPuller {
                 }
             }
 
-            log::trace!("got batch");
+            log::trace!("got batch for {}", self.tree_name);
 
             // DANGER! TODO This is wrong. You know why!
             //
@@ -274,7 +280,7 @@ impl ReplicationPuller {
             // batch.
             stream::iter(update_buffer.into_iter().zip(systems.iter().cycle()))
                 .for_each_concurrent(None, |(update, system)| {
-                    let spec = self.replicate_spec.clone();
+                    let tree_name = tree_name.clone();
 
                     async move {
                         'outer: loop {
@@ -284,7 +290,7 @@ impl ReplicationPuller {
                                 if let Err(err) = system.send(spec_number, &update).await {
                                     log::warn!(
                                         "could not update `{}` (retrying): {}",
-                                        &spec.tree_name,
+                                        &tree_name,
                                         err
                                     );
                                 } else {
@@ -299,30 +305,28 @@ impl ReplicationPuller {
                     }
                 })
                 .await;
-
-            log::trace!("committing");
         }
 
-        log::info!("finished sending events");
+        log::info!("finished sending events for {}", self.tree_name);
     }
 }
 
-pub struct ReplicationSender {
+pub struct ReplicationSenderPool {
     parameters: String,
     n_connections: usize,
-    pullers: Vec<ReplicationPuller>,
+    senders: Vec<ReplicationSender>,
 }
 
-impl ReplicationSender {
+impl ReplicationSenderPool {
     pub fn new(
         parameters: String,
         n_connections: usize,
-        pullers: Vec<ReplicationPuller>,
-    ) -> ReplicationSender {
-        ReplicationSender {
+        senders: Vec<ReplicationSender>,
+    ) -> ReplicationSenderPool {
+        ReplicationSenderPool {
             parameters,
             n_connections,
-            pullers,
+            senders,
         }
     }
 
@@ -332,7 +336,7 @@ impl ReplicationSender {
         // Ensuring schema:
         log::info!("ensuring schema is initiated");
         let client = connect(&self.parameters).await;
-        future::try_join_all(self.pullers.iter().map(|puller| {
+        future::try_join_all(self.senders.iter().map(|puller| {
             // log::info!("{}", puller.replicate_spec.create_commands);
             client.batch_execute(&puller.replicate_spec.create_commands)
         }))
@@ -342,7 +346,7 @@ impl ReplicationSender {
 
         // init systems:
         let all_specs = self
-            .pullers
+            .senders
             .iter()
             .map(|puller| Arc::clone(&puller.replicate_spec))
             .collect::<Vec<_>>();
@@ -359,7 +363,7 @@ impl ReplicationSender {
 
             // run events:
             future::join_all(
-                self.pullers
+                self.senders
                     .into_iter()
                     .enumerate()
                     .map(|(spec_number, puller)| puller.send_events(spec_number, systems.clone())),

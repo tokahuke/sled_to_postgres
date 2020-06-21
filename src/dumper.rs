@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::{file_name_for_tree, ReplicationUpdate, BATCH_SIZE};
+use super::{name_for_tree, ReplicationUpdate, BATCH_SIZE};
 
 pub struct ReplicationDumper {
+    tree_name: String,
     queue_sender: yaque::Sender,
     tree: sled::Tree,
     prefix: Vec<u8>,
@@ -27,6 +28,7 @@ impl ReplicationDumper {
 
         Ok(ReplicationDumper {
             queue_sender,
+            tree_name: name_for_tree(&tree, &prefix),
             tree,
             prefix,
             is_shutdown,
@@ -53,10 +55,7 @@ impl ReplicationDumper {
     pub fn dump(mut self) {
         // If dumped, do not dump again!
         if self.was_dumped() {
-            log::info!(
-                "{} already dumped",
-                file_name_for_tree(&self.tree, &self.prefix)
-            );
+            log::info!("{} already dumped", self.tree_name,);
             return;
         }
 
