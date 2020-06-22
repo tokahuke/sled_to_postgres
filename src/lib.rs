@@ -64,7 +64,7 @@
 //!     });
 //!     
 //! tokio::spawn(async move {
-//!     // Do not insert anything before starting the replication. These events will not be logged.
+//!     // Do not insert anything before starting the replication. These updates will not be logged.
 //!     // tree.insert(&987i32.to_be_bytes(), &654i32.to_be_bytes()).unwrap();
 //!     
 //!     // Although the current state of the database *will* be dumped with the
@@ -170,7 +170,7 @@ pub struct ReplicateTree<'a, Ins, Rm> {
     /// (not get error if ran twice).
     pub create_commands: &'a str,
     /// Single _prepared_ statement for inserting in Postgres. This must be
-    /// *idempotent*, that is, must accommodate repeated events.
+    /// *idempotent*, that is, must accommodate repeated updates.
     pub insert_statement: &'a str,
     /// Single _prepared_ statement for removing in Postgres. This must be
     /// *idempotent*, that is, not return error if the supplied key does not
@@ -351,14 +351,14 @@ impl Replication {
 
     /// Sets the whole system up, returning a future to the completion of the
     /// replication and a channel to _kind of_ trigger the end of the process
-    /// of watching for events.
+    /// of watching for updates.
     pub async fn start(self) -> Result<ReplicationStopper, crate::Error> {
         // Create signaler for shutdown:
         let is_shutdown = Arc::new(AtomicBool::new(false));
 
         // Create pushers:
         let pushers = self.make_pushers(is_shutdown.clone())?;
-        let push_stuff = future::join_all(pushers.into_iter().map(|pusher| pusher.push_events()));
+        let push_stuff = future::join_all(pushers.into_iter().map(|pusher| pusher.push_updates()));
 
         // Set up the streaming part:
         let stream_stuff = self.make_senders(&self.dir_for_stream())?.prepare().await?;

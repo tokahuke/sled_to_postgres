@@ -220,8 +220,8 @@ impl ReplicationSender {
         })
     }
 
-    async fn send_events(mut self, spec_number: usize, systems: Arc<Vec<SqlSystem>>) {
-        log::info!("puller started to send events for {}", self.tree_name);
+    async fn send_updates(mut self, spec_number: usize, systems: Arc<Vec<SqlSystem>>) {
+        log::info!("puller started to send updates for {}", self.tree_name);
         let mut is_done = false;
         let tree_name = Arc::new(self.tree_name.clone());
 
@@ -307,7 +307,7 @@ impl ReplicationSender {
                 .await;
         }
 
-        log::info!("finished sending events for {}", self.tree_name);
+        log::info!("finished sending updates for {}", self.tree_name);
     }
 }
 
@@ -359,18 +359,18 @@ impl ReplicationSenderPool {
         );
 
         Ok(async move {
-            log::info!("starting to send events");
+            log::info!("starting to send updates");
 
-            // run events:
+            // run updates:
             future::join_all(
                 self.senders
                     .into_iter()
                     .enumerate()
-                    .map(|(spec_number, puller)| puller.send_events(spec_number, systems.clone())),
+                    .map(|(spec_number, puller)| puller.send_updates(spec_number, systems.clone())),
             )
             .await;
 
-            log::info!("done sending events");
+            log::info!("done sending updates");
         })
     }
 }

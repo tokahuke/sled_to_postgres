@@ -34,8 +34,8 @@ impl ReplicationPusher {
         })
     }
 
-    pub async fn push_events(mut self) {
-        log::info!("starting to push events for {}", self.tree_name);
+    pub async fn push_updates(mut self) {
+        log::info!("starting to push updates for {}", self.tree_name);
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut batch_number: usize = 0;
 
@@ -111,6 +111,6 @@ impl ReplicationPusher {
             self.queue_sender.save().expect("queue error");
         }
 
-        log::info!("finished pushing events for {}", self.tree_name);
+        log::info!("finished pushing updates for {}", self.tree_name);
     }
 }
