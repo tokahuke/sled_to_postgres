@@ -22,13 +22,14 @@ impl ReplicationDumper {
         prefix: Vec<u8>,
         is_shutdown: Arc<AtomicBool>,
     ) -> Result<ReplicationDumper, crate::Error> {
-        let queue_sender = yaque::Sender::open(replication_dir.as_ref())?;
+        let tree_name = name_for_tree(&tree, &prefix);
+        let queue_sender = yaque::Sender::open(replication_dir.as_ref().join(&tree_name))?;
         let key_file = replication_dir.as_ref().join("last-key");
         let is_dumped_flag = replication_dir.as_ref().join("is-dumped.flag");
 
         Ok(ReplicationDumper {
             queue_sender,
-            tree_name: name_for_tree(&tree, &prefix),
+            tree_name,
             tree,
             prefix,
             is_shutdown,

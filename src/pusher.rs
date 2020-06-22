@@ -22,10 +22,11 @@ impl ReplicationPusher {
         is_shutdown: Arc<AtomicBool>,
         inactive_period: time::Duration,
     ) -> Result<ReplicationPusher, crate::Error> {
-        let queue_sender = yaque::Sender::open(replication_dir)?;
+        let tree_name = name_for_tree(tree, prefix);
+        let queue_sender = yaque::Sender::open(replication_dir.as_ref().join(&tree_name))?;
 
         Ok(ReplicationPusher {
-            tree_name: name_for_tree(tree, prefix),
+            tree_name,
             queue_sender,
             subscriber: tree.watch_prefix(prefix),
             is_shutdown,
