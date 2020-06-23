@@ -1,7 +1,8 @@
+use futures::future;
 use futures::prelude::*;
-use futures::{future, stream};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -100,12 +101,12 @@ impl SqlSystemInner {
         // Create prepared statements which we will use to upload stuff.
         let client = connect(&parameters).await;
         let insert_statements = future::try_join_all(replicate_specs.iter().map(|spec| {
-            // log::info!("{}", spec.insert_statement);
+            log::debug!("{}", spec.insert_statement);
             client.prepare(&spec.insert_statement)
         }))
         .await?;
         let remove_statements = future::try_join_all(replicate_specs.iter().map(|spec| {
-            // log::info!("{}", spec.remove_statement);
+            log::debug!("{}", spec.remove_statement);
             client.prepare(&spec.remove_statement)
         }))
         .await?;
@@ -118,6 +119,63 @@ impl SqlSystemInner {
             remove_statements,
         })
     }
+}
+
+enum UpdateEntry {
+    Insert(Vec<u8>),
+    Remove,
+}
+
+#[derive(Default)]
+struct UpdateMap {
+    n_updates: usize,
+    entries: BTreeMap<Vec<u8>, UpdateEntry>,
+}
+
+impl UpdateMap {
+    /// This function is cleverer than it seems!
+    fn push(&mut self, update: ReplicationUpdate) {
+        match update {
+            ReplicationUpdate::Insert { key, value } => {
+                self.entries.insert(key, UpdateEntry::Insert(value));
+            }
+            ReplicationUpdate::Remove { key } => {
+                self.entries.insert(key, UpdateEntry::Remove);
+            }
+        }
+
+        self.n_updates += 1;
+    }
+
+    fn len(&self) -> usize {
+        self.n_updates
+    }
+
+    fn into_batches(self) -> [UpdateBatch; 2] {
+        let mut insert_keys = vec![];
+        let mut insert_values = vec![];
+        let mut removes = vec![];
+
+        for (key, update_entry) in self.entries {
+            match update_entry {
+                UpdateEntry::Insert(value) => {
+                    insert_keys.push(key);
+                    insert_values.push(value);
+                }
+                UpdateEntry::Remove => removes.push(key),
+            }
+        }
+
+        [
+            UpdateBatch::Insert(insert_keys, insert_values),
+            UpdateBatch::Remove(removes),
+        ]
+    }
+}
+
+enum UpdateBatch {
+    Insert(Vec<Vec<u8>>, Vec<Vec<u8>>),
+    Remove(Vec<Vec<u8>>),
 }
 
 struct SqlSystem {
@@ -153,41 +211,59 @@ impl SqlSystem {
         }
     }
 
-    async fn send(
+    async fn insert(
         &self,
         spec_number: usize,
-        update: &ReplicationUpdate,
+        insert_keys: &[Vec<u8>],
+        insert_values: &[Vec<u8>],
     ) -> Result<(), crate::Error> {
         let guard = self.inner.read().await;
         let spec = &guard.replicate_specs[spec_number];
         let insert = &guard.insert_statements[spec_number];
+
+        let parameters = (spec.insert_parameters)(insert_keys, insert_values);
+
+        // Need to do like this to please borrow checker:
+        let mut parameter_refs = Vec::with_capacity(parameters.len());
+        for param in &parameters {
+            parameter_refs.push(param.as_ref() as &(dyn ToSql + Sync));
+        }
+
+        let x = guard.client.query(insert, &*parameter_refs);
+
+        x.await?;
+
+        Ok(())
+    }
+
+    async fn remove(
+        &self,
+        spec_number: usize,
+        remove_keys: &[Vec<u8>],
+    ) -> Result<(), crate::Error> {
+        let guard = self.inner.read().await;
+        let spec = &guard.replicate_specs[spec_number];
         let remove = &guard.remove_statements[spec_number];
 
-        match update {
-            ReplicationUpdate::Insert { key, value } => {
-                let parameters = (spec.insert_parameters)(&key, &value);
+        let parameters = (spec.remove_parameters)(remove_keys);
 
-                // Need to do like this to please borrow checker:
-                let mut parameter_refs = Vec::with_capacity(parameters.len());
-                for param in &parameters {
-                    parameter_refs.push(param.as_ref() as &(dyn ToSql + Sync));
-                }
+        // Need to do like this to please borrow checker:
+        let mut parameter_refs = Vec::with_capacity(parameters.len());
+        for param in &parameters {
+            parameter_refs.push(param.as_ref() as &(dyn ToSql + Sync));
+        }
 
-                let x = guard.client.query(insert, &*parameter_refs);
+        let x = guard.client.query(remove, &*parameter_refs);
 
-                x.await?;
-            }
-            ReplicationUpdate::Remove { key } => {
-                let parameters = (spec.remove_parameters)(&key);
+        x.await?;
 
-                // Need to do like this to please borrow checker:
-                let mut parameter_refs = Vec::with_capacity(parameters.len());
-                for param in &parameters {
-                    parameter_refs.push(param.as_ref() as &(dyn ToSql + Sync));
-                }
+        Ok(())
+    }
 
-                guard.client.query(remove, &*parameter_refs).await?;
-            }
+    async fn send(&self, spec_number: usize, batch: &UpdateBatch) -> Result<(), crate::Error> {
+        match batch {
+            UpdateBatch::Insert(keys, values) => self.insert(spec_number, &keys, &values).await?,
+            UpdateBatch::Remove(keys) => self.remove(spec_number, &keys).await?,
         }
 
         Ok(())
@@ -224,11 +300,12 @@ impl ReplicationSender {
         log::info!("puller started to send updates for {}", self.tree_name);
         let mut is_done = false;
         let tree_name = Arc::new(self.tree_name.clone());
+        let mut system_iter = systems.iter().cycle();
 
         // Now, upload stuff while they come in...
         while !is_done {
             // Yes, temporary (you can optimize this one later):
-            let mut update_buffer = Vec::with_capacity(128);
+            let mut update_buffer = UpdateMap::default();
 
             loop {
                 // Yes, now that receiving is atomic, I can do this.
@@ -267,44 +344,41 @@ impl ReplicationSender {
 
             log::trace!("got batch for {}", self.tree_name);
 
-            // DANGER! TODO This is wrong. You know why!
-            //
-            // This executes queries out of order, so if there if an insertion
-            // and its corresponding deletion happen to be in the same batch,
-            // we could have a race condition in which the line is deleted (a
-            // no-op) before insertion, ending up in a line that should not be
-            // there.
-            //
-            // Alternative is to stop being lazy and to run this code first for
-            // all insertions in the batch and _then_ for all deletions in the
-            // batch.
-            stream::iter(update_buffer.into_iter().zip(systems.iter().cycle()))
-                .for_each_concurrent(None, |(update, system)| {
-                    let tree_name = tree_name.clone();
+            let system = system_iter.next().expect("infinite iterator");
+            let [insert, remove] = update_buffer.into_batches();
 
-                    async move {
-                        'outer: loop {
-                            let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
+            'insert: loop {
+                let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
 
-                            while backoff.tick().await {
-                                if let Err(err) = system.send(spec_number, &update).await {
-                                    log::warn!(
-                                        "could not update `{}` (retrying): {}",
-                                        &tree_name,
-                                        err
-                                    );
-                                } else {
-                                    log::trace!("sent event");
-                                    break 'outer;
-                                };
-                            }
+                while backoff.tick().await {
+                    if let Err(err) = system.send(spec_number, &insert).await {
+                        log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
+                    } else {
+                        log::trace!("sent event");
+                        break 'insert;
+                    };
+                }
 
-                            log::warn!("too many retries to send update. Will trigger reconnect.");
-                            system.trigger_refresh().await;
-                        }
-                    }
-                })
-                .await;
+                log::warn!("too many retries to send update. Will trigger reconnect.");
+                system.trigger_refresh().await;
+            }
+
+            // 'Oops! Duplicated code.
+            'remove: loop {
+                let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
+
+                while backoff.tick().await {
+                    if let Err(err) = system.send(spec_number, &remove).await {
+                        log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
+                    } else {
+                        log::trace!("sent event");
+                        break 'remove;
+                    };
+                }
+
+                log::warn!("too many retries to send update. Will trigger reconnect.");
+                system.trigger_refresh().await;
+            }
         }
 
         log::info!("finished sending updates for {}", self.tree_name);

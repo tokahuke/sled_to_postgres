@@ -111,6 +111,7 @@ mod dumper;
 mod error;
 mod pusher;
 mod sender;
+pub mod tuples;
 
 /// Reexport of `tokio_postgres::types::ToSql`:
 pub use tokio_postgres::types::ToSql;
@@ -127,10 +128,11 @@ use tokio::time;
 use crate::dumper::ReplicationDumper;
 use crate::pusher::ReplicationPusher;
 use crate::sender::{ReplicationSender, ReplicationSenderPool};
+use crate::tuples::SqlArrayTuple;
 
 // This is useful for debugging:
 
-const BATCH_SIZE: usize = 128;
+const BATCH_SIZE: usize = 256;
 
 /// The canonical identification of a prefix within a tree.
 fn name_for_tree(tree: &sled::Tree, prefix: &[u8]) -> String {
@@ -148,9 +150,9 @@ enum ReplicationUpdate {
 
 /// Boxed function for transforming from Sled to Postgres for insertion.
 type InsertParameters =
-    Box<dyn Send + Sync + Fn(&[u8], &[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
+    Box<dyn Send + Sync + Fn(&[Vec<u8>], &[Vec<u8>]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
 /// Boxed function for transforming from Sled to Postgres for removal.
-type RemoveParameters = Box<dyn Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
+type RemoveParameters = Box<dyn Send + Sync + Fn(&[Vec<u8>]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
 
 struct ReplicateSpec {
     create_commands: String,
@@ -214,17 +216,45 @@ impl Replication {
     }
 
     /// Pushes a new replication spec of replication on a tree.
-    pub fn push<Ins, Rm>(mut self, replicate_tree: ReplicateTree<'_, Ins, Rm>) -> Self
+    pub fn push<Ins, InsTuple, Rm, RmTuple>(
+        mut self,
+        replicate_tree: ReplicateTree<'_, Ins, Rm>,
+    ) -> Self
     where
-        Ins: 'static + Send + Sync + Fn(&[u8], &[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
-        Rm: 'static + Send + Sync + Fn(&[u8]) -> Vec<Box<dyn ToSql + Send + Sync>>,
+        InsTuple: crate::tuples::SqlTuple,
+        RmTuple: crate::tuples::SqlTuple,
+        Ins: 'static + Send + Sync + Fn(&[u8], &[u8]) -> InsTuple,
+        Rm: 'static + Send + Sync + Fn(&[u8]) -> RmTuple,
     {
+        let insert_parameters = replicate_tree.insert_parameters;
+        let remove_parameters = replicate_tree.remove_parameters;
+
+        let insert_many = move |keys: &[Vec<u8>], values: &[Vec<u8>]| {
+            let mut array_tuple = InsTuple::ArrayTuple::init();
+            for (key, value) in keys.iter().zip(values) {
+                let tuple = (insert_parameters)(key, value);
+                tuple.update(&mut array_tuple)
+            }
+
+            array_tuple.into_params()
+        };
+
+        let remove_many = move |keys: &[Vec<u8>]| {
+            let mut array_tuple = RmTuple::ArrayTuple::init();
+            for key in keys {
+                let tuple = (remove_parameters)(key);
+                tuple.update(&mut array_tuple)
+            }
+
+            array_tuple.into_params()
+        };
+
         let spec = ReplicateSpec {
             create_commands: replicate_tree.create_commands.to_owned(),
             insert_statement: replicate_tree.insert_statement.to_owned(),
             remove_statement: replicate_tree.remove_statement.to_owned(),
-            insert_parameters: Box::new(replicate_tree.insert_parameters),
-            remove_parameters: Box::new(replicate_tree.remove_parameters),
+            insert_parameters: Box::new(insert_many),
+            remove_parameters: Box::new(remove_many),
         };
 
         self.replicate_specs.push(Arc::new(spec));
@@ -479,12 +509,13 @@ mod tests {
                 );
             ",
             insert_statement: "
-                insert into a_table values ($1::int, $2::int)
+                insert into a_table
+                select * from unnest($1::int[], $2::int[])
                 on conflict (x) do update set x = excluded.x;
             ",
-            remove_statement: "delete from a_table where x = $1::int",
-            insert_parameters: |key: &[u8], value: &[u8]| params![decode(&*key), decode(&*value)],
-            remove_parameters: |key: &[u8]| params![decode(&*key)],
+            remove_statement: "delete from a_table using unnest($1::int[]) as _ (a) where x = a",
+            insert_parameters: |key: &[u8], value: &[u8]| (decode(&*key), decode(&*value)),
+            remove_parameters: |key: &[u8]| (decode(&*key),),
         })
     }
 
