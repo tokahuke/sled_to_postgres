@@ -178,6 +178,15 @@ enum UpdateBatch {
     Remove(Vec<Vec<u8>>),
 }
 
+impl UpdateBatch {
+    fn is_empty(&self) -> bool {
+        match self {
+            UpdateBatch::Insert(keys, _) => keys.is_empty(),
+            UpdateBatch::Remove(keys) => keys.is_empty(),
+        }
+    }
+}
+
 struct SqlSystem {
     inner: RwLock<SqlSystemInner>,
     update_lock: Mutex<()>,
@@ -345,39 +354,30 @@ impl ReplicationSender {
             log::trace!("got batch for {}", self.tree_name);
 
             let system = system_iter.next().expect("infinite iterator");
-            let [insert, remove] = update_buffer.into_batches();
 
-            'insert: loop {
-                let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
-
-                while backoff.tick().await {
-                    if let Err(err) = system.send(spec_number, &insert).await {
-                        log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
-                    } else {
-                        log::trace!("sent event");
-                        break 'insert;
-                    };
+            for batch in update_buffer.into_batches().iter() {
+                // Do nothing if batch is empty:
+                if batch.is_empty() {
+                    continue;
                 }
 
-                log::warn!("too many retries to send update. Will trigger reconnect.");
-                system.trigger_refresh().await;
-            }
-
-            // 'Oops! Duplicated code.
-            'remove: loop {
-                let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
-
-                while backoff.tick().await {
-                    if let Err(err) = system.send(spec_number, &remove).await {
-                        log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
-                    } else {
-                        log::trace!("sent event");
-                        break 'remove;
-                    };
-                }
-
-                log::warn!("too many retries to send update. Will trigger reconnect.");
-                system.trigger_refresh().await;
+                // Now, try to send until you succeed, no matter the cost:
+                // Go for it!
+                'outer: loop {
+                    let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
+    
+                    while backoff.tick().await {
+                        if let Err(err) = system.send(spec_number, &batch).await {
+                            log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
+                        } else {
+                            log::trace!("sent event");
+                            break 'outer;
+                        };
+                    }
+    
+                    log::warn!("too many retries to send update. Will trigger reconnect.");
+                    system.trigger_refresh().await;
+                }    
             }
         }
 

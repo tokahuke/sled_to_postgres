@@ -538,7 +538,7 @@ mod tests {
         log::info!("inserted");
 
         // when you are done, trigger shutdown:
-        tokio::time::delay_for(tokio::time::Duration::from_millis(1000)).await;
+        tokio::time::delay_for(tokio::time::Duration::from_millis(2000)).await;
         log::info!("slept. Waking up");
 
         stopper.stop().await;
