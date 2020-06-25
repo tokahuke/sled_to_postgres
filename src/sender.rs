@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{delay_for, Duration};
+use tokio::time::{timeout, delay_for, Duration};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Statement};
 
@@ -100,16 +100,36 @@ impl SqlSystemInner {
     ) -> Result<SqlSystemInner, crate::Error> {
         // Create prepared statements which we will use to upload stuff.
         let client = connect(&parameters).await;
-        let insert_statements = future::try_join_all(replicate_specs.iter().map(|spec| {
-            log::debug!("{}", spec.insert_statement);
-            client.prepare(&spec.insert_statement)
-        }))
-        .await?;
-        let remove_statements = future::try_join_all(replicate_specs.iter().map(|spec| {
-            log::debug!("{}", spec.remove_statement);
-            client.prepare(&spec.remove_statement)
-        }))
-        .await?;
+        let mut insert_statements = vec![];
+        let mut remove_statements = vec![];
+
+        for spec in replicate_specs.iter() {
+            log::debug!("{}: {}", spec.name, spec.insert_statement);
+            match client.prepare(&spec.insert_statement).await {
+                Ok(statement) => insert_statements.push(statement),
+                Err(err) => {
+                    log::warn!(
+                        "failed to prepare insert statement for `{}`: `{}`",
+                        spec.name,
+                        err
+                    );
+                }
+            }
+        }
+
+        for spec in replicate_specs.iter() {
+            log::debug!("{}: {}", spec.name, spec.insert_statement);
+            match client.prepare(&spec.remove_statement).await {
+                Ok(statement) => remove_statements.push(statement),
+                Err(err) => {
+                    log::warn!(
+                        "failed to prepare remove statement for `{}`: `{}`",
+                        spec.name,
+                        err
+                    );
+                }
+            }
+        }
 
         Ok(SqlSystemInner {
             parameters,
@@ -318,18 +338,19 @@ impl ReplicationSender {
 
             loop {
                 // Yes, now that receiving is atomic, I can do this.
-                match future::select(
-                    Box::pin(self.queue_receiver.recv()),
-                    delay_for(self.inactive_period),
+                match timeout(
+                    self.inactive_period,
+                    self.queue_receiver.recv(),
                 )
                 .await
                 {
                     // Timed out! Let's send what we have got.
-                    future::Either::Right((_, _)) => {
+                    Err(_) => {
+                        log::trace!("sender for {} timed out", self.tree_name);
                         break;
                     }
                     // Received something:
-                    future::Either::Left((maybe_guard, _)) => {
+                    Ok(maybe_guard) => {
                         let guard = maybe_guard.expect("queue error");
                         let deserialized =
                             bincode::deserialize(&guard).expect("error deserializing update");
@@ -344,7 +365,7 @@ impl ReplicationSender {
                             is_done = true;
                         }
 
-                        if is_done || update_buffer.len() >= 128 {
+                        if is_done || update_buffer.len() >= crate::BATCH_SIZE {
                             break;
                         }
                     }
@@ -358,6 +379,7 @@ impl ReplicationSender {
             for batch in update_buffer.into_batches().iter() {
                 // Do nothing if batch is empty:
                 if batch.is_empty() {
+                    log::trace!("batch was empty");
                     continue;
                 }
 
@@ -365,19 +387,19 @@ impl ReplicationSender {
                 // Go for it!
                 'outer: loop {
                     let mut backoff = UPDATE_EXPONENTIAL_BACKOFF.clone();
-    
+
                     while backoff.tick().await {
                         if let Err(err) = system.send(spec_number, &batch).await {
                             log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
                         } else {
-                            log::trace!("sent event");
+                            log::trace!("sent batch");
                             break 'outer;
                         };
                     }
-    
+
                     log::warn!("too many retries to send update. Will trigger reconnect.");
                     system.trigger_refresh().await;
-                }    
+                }
             }
         }
 

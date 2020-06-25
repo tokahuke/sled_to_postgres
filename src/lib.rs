@@ -155,6 +155,7 @@ type InsertParameters =
 type RemoveParameters = Box<dyn Send + Sync + Fn(&[Vec<u8>]) -> Vec<Box<dyn ToSql + Send + Sync>>>;
 
 struct ReplicateSpec {
+    name: String,
     create_commands: String,
     insert_statement: String,
     remove_statement: String,
@@ -250,6 +251,7 @@ impl Replication {
         };
 
         let spec = ReplicateSpec {
+            name: name_for_tree(&replicate_tree.tree, &replicate_tree.prefix),
             create_commands: replicate_tree.create_commands.to_owned(),
             insert_statement: replicate_tree.insert_statement.to_owned(),
             remove_statement: replicate_tree.remove_statement.to_owned(),
@@ -276,7 +278,7 @@ impl Replication {
 
     /// Create sender using a given directory name scheme.
     fn make_senders<P: AsRef<Path>>(&self, base: P) -> Result<ReplicationSenderPool, crate::Error> {
-        const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(200);
+        const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(500);
         let pullers = self
             .replicate_specs
             .iter()

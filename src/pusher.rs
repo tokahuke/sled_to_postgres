@@ -1,4 +1,3 @@
-use futures::future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -59,10 +58,9 @@ impl ReplicationPusher {
 
         // Now, to the main course:
         loop {
-            let timeout = time::delay_for(self.inactive_period);
-            match future::select(&mut self.subscriber, timeout).await {
+            match time::timeout(self.inactive_period, &mut self.subscriber).await {
                 // Got timeout:
-                future::Either::Right((_, _)) => {
+                Err(_) => {
                     if self.is_shutdown.load(Ordering::Relaxed) {
                         log::debug!("is shutdown and has timed out");
                         break;
@@ -73,12 +71,12 @@ impl ReplicationPusher {
                     }
                 }
                 // Subscriber ended:
-                future::Either::Left((None, _)) => {
+                Ok(None) => {
                     log::info!("subscriber to {} finished", self.tree_name);
                     break;
                 }
                 // Got event:
-                future::Either::Left((Some(event), _)) => {
+                Ok(Some(event)) => {
                     log::trace!("got event for {}", self.tree_name);
 
                     let update = match event {
