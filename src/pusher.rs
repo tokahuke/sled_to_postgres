@@ -65,7 +65,7 @@ impl ReplicationPusher {
                         log::debug!("is shutdown and has timed out");
                         break;
                     } else {
-                        // Let's take the opportunity to sate stuff:
+                        // Let's take the opportunity to save stuff:
                         log::trace!("has timed out but is not shutdown");
                         save(&mut batch);
                     }

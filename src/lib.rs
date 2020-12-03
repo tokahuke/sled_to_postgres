@@ -277,7 +277,11 @@ impl Replication {
     }
 
     /// Create sender using a given directory name scheme.
-    fn make_senders<P: AsRef<Path>>(&self, base: P) -> Result<ReplicationSenderPool, crate::Error> {
+    fn make_senders<P: AsRef<Path>>(
+        &self,
+        base: P,
+        is_shutdown: Arc<AtomicBool>,
+    ) -> Result<ReplicationSenderPool, crate::Error> {
         const DEFAULT_INACTIVE_PERIOD: time::Duration = time::Duration::from_millis(500);
         let pullers = self
             .replicate_specs
@@ -289,6 +293,7 @@ impl Replication {
                     tree,
                     prefix,
                     spec.clone(),
+                    is_shutdown.clone(),
                     DEFAULT_INACTIVE_PERIOD,
                 )
             })
@@ -366,7 +371,10 @@ impl Replication {
         let dumpers = self.make_dumpers(is_shutdown.clone())?;
 
         // Create sender for dump:
-        let send_stuff = self.make_senders(&self.dir_for_dump())?.prepare().await?;
+        let send_stuff = self
+            .make_senders(&self.dir_for_dump(), is_shutdown.clone())?
+            .prepare()
+            .await?;
 
         let whole_thing = future::join(
             send_stuff,
@@ -393,36 +401,19 @@ impl Replication {
         let push_stuff = future::join_all(pushers.into_iter().map(|pusher| pusher.push_updates()));
 
         // Set up the streaming part:
-        let stream_stuff = self.make_senders(&self.dir_for_stream())?.prepare().await?;
+        let stream_stuff = self
+            .make_senders(&self.dir_for_stream(), is_shutdown.clone())?
+            .prepare()
+            .await?;
 
         // Set up the conditional dump:
         let maybe_dump = self.setup_dump(is_shutdown.clone()).await?;
 
         // Create the whole thing!
-        //
-        // BIG NOTE: `select` instead of `join`. Why?
-        //
-        // `push_stuff` will take at least 500ms to stop. It will stop any
-        // sender in the right side and that is ok, since the queues will
-        // rollback. Also, the 500m will give a head-start for the dumpers
-        // (which are _synchronous_) to stop. Now, remember that the dump tasks
-        // are run as blocking and that the `select` will effectively drop the
-        // handles on their completion. This means that we *have no way* of
-        // waiting on their completion and that we have a possible data race
-        // here!
-        //
-        // On the other side, the dumpers will check the `is_shutdown` often
-        // enough to shutdown in 500ms and so we *hope* (hope!) that this race
-        // condition will be infrequent. Since the consequence of the data race
-        // seems to be basically lost computer power, this looks benign. However,
-        // this hypothesis has not been put to test.
-        //
-        // Alternatives are making dumps async (difficult, since
-        // `sled::Iter: !Send`) or using `join` and propagating the shutdown
-        // signal into `ReplicationSender`, which is not currently implemented.
-        let whole_thing = future::select(
-            Box::pin(push_stuff),
-            Box::pin(maybe_dump.then(move |_| stream_stuff)),
+        let whole_thing = future::join(
+            push_stuff,
+            maybe_dump.then(move |_| stream_stuff),
+            // maybe_dump,
         )
         .map(|_| ());
 

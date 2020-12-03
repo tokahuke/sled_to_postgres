@@ -1,14 +1,14 @@
 use futures::future;
 use futures::prelude::*;
-use native_tls::TlsConnector;
-use postgres_native_tls::MakeTlsConnector;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{timeout, delay_for, Duration};
+use tokio::time::{delay_for, timeout, Duration};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Statement};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::{name_for_tree, ReplicateSpec, ReplicationUpdate};
 
@@ -59,17 +59,32 @@ impl ExponentialBackoff {
 }
 
 async fn try_connect(parameters: &str) -> Result<Client, crate::Error> {
-    let mut builder = TlsConnector::builder();
-    builder.danger_accept_invalid_certs(true);
-    let connector = builder.build().expect("could not build TLS connector");
-    let (client, connection) =
-        tokio_postgres::connect(parameters, MakeTlsConnector::new(connector)).await?;
+    // let mut builder = rustls::ClientConfig::new();
+    // let connector = builder.build().expect("could not build TLS connector");
+    // let connector = MakeRustlsConnect::new(connector);
+    let (client, connection) = tokio_postgres::connect(parameters, tokio_postgres::NoTls).await?;
 
     tokio::spawn(async move {
         connection.await.ok();
     });
 
     Ok(client)
+}
+
+#[tokio::test]
+async fn test_try_connect() {
+    let config = rustls::ClientConfig::new();
+    let connector = MakeRustlsConnect::new(config);
+    let (client, connection) =
+        tokio_postgres::connect("host=localhost user=pedro dbname=postgres", connector)
+            .await
+            .unwrap();
+
+    tokio::spawn(async move {
+        connection.await.ok();
+    });
+
+    client.simple_query("select 1;").await.unwrap();
 }
 
 async fn connect(parameters: &str) -> Client {
@@ -303,6 +318,7 @@ pub struct ReplicationSender {
     tree_name: String,
     queue_receiver: yaque::Receiver,
     replicate_spec: Arc<ReplicateSpec>,
+    is_shutdown: Arc<AtomicBool>,
     inactive_period: Duration,
 }
 
@@ -312,6 +328,7 @@ impl ReplicationSender {
         tree: &sled::Tree,
         prefix: &[u8],
         replicate_spec: Arc<ReplicateSpec>,
+        is_shutdown: Arc<AtomicBool>,
         inactive_period: Duration,
     ) -> Result<ReplicationSender, crate::Error> {
         let tree_name = name_for_tree(tree, prefix);
@@ -321,6 +338,7 @@ impl ReplicationSender {
             tree_name,
             queue_receiver,
             replicate_spec,
+            is_shutdown,
             inactive_period,
         })
     }
@@ -332,22 +350,17 @@ impl ReplicationSender {
         let mut system_iter = systems.iter().cycle();
 
         // Now, upload stuff while they come in...
-        while !is_done {
+        'main: while !is_done && !self.is_shutdown.load(Ordering::Relaxed) {
             // Yes, temporary (you can optimize this one later):
             let mut update_buffer = UpdateMap::default();
 
-            loop {
+            'recv: loop {
                 // Yes, now that receiving is atomic, I can do this.
-                match timeout(
-                    self.inactive_period,
-                    self.queue_receiver.recv(),
-                )
-                .await
-                {
+                match timeout(self.inactive_period, self.queue_receiver.recv()).await {
                     // Timed out! Let's send what we have got.
                     Err(_) => {
                         log::trace!("sender for {} timed out", self.tree_name);
-                        break;
+                        break 'recv;
                     }
                     // Received something:
                     Ok(maybe_guard) => {
@@ -366,7 +379,7 @@ impl ReplicationSender {
                         }
 
                         if is_done || update_buffer.len() >= crate::BATCH_SIZE {
-                            break;
+                            break 'recv;
                         }
                     }
                 }
@@ -391,6 +404,15 @@ impl ReplicationSender {
                     while backoff.tick().await {
                         if let Err(err) = system.send(spec_number, &batch).await {
                             log::warn!("could not update `{}` (retrying): {}", self.tree_name, err);
+
+                            // Check if it is done:
+                            if self.is_shutdown.load(Ordering::Relaxed) {
+                                log::error!(
+                                    "was shutdown during retry. You have lost a small
+                                    amount of data. This may change in the future."
+                                );
+                                break 'main;
+                            }
                         } else {
                             log::trace!("sent batch");
                             break 'outer;

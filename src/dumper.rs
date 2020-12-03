@@ -23,9 +23,10 @@ impl ReplicationDumper {
         is_shutdown: Arc<AtomicBool>,
     ) -> Result<ReplicationDumper, crate::Error> {
         let tree_name = name_for_tree(&tree, &prefix);
-        let queue_sender = yaque::Sender::open(replication_dir.as_ref().join(&tree_name))?;
-        let key_file = replication_dir.as_ref().join("last-key");
-        let is_dumped_flag = replication_dir.as_ref().join("is-dumped.flag");
+        let tree_path = replication_dir.as_ref().join(&tree_name);
+        let queue_sender = yaque::Sender::open(&tree_path)?;
+        let key_file = tree_path.join("last-key");
+        let is_dumped_flag = tree_path.join("is-dumped.flag");
 
         Ok(ReplicationDumper {
             queue_sender,
@@ -122,6 +123,8 @@ impl ReplicationDumper {
                 if self.is_shutdown.load(Ordering::Relaxed) {
                     log::info!("dump told to shut down");
                     self.save_last_key(key);
+
+                    log::debug!("saved last key for later");
 
                     // Returning early prevents dump to be capped off.
                     return;
